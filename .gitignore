@@ -1,0 +1,8 @@
+build/
+*.mexa64
+*.mexw64
+*.mexmaci64
+*.mexmaca64
+*.o
+*.obj
+.vscode/
