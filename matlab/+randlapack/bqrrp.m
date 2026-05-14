@@ -28,14 +28,12 @@ function [out1, out2, J, state_out] = bqrrp(A, varargin)
 %
 %   A must be single or double precision, real, and 2D.
 %
-%   Example (explicit):
+%   Example:
 %       A = randn(2000, 200);
-%       [Q, R, J] = randlapack.bqrrp(A);
-%       err = norm(A(:, J) - Q * R, 'fro') / norm(A, 'fro');
-%
-%   Example (implicit):
-%       [A_out, tau, J] = randlapack.bqrrp(A, 'implicit');
-%       R = triu(A_out(1:size(A,2), :));  % R lives in the upper triangle
+%       [Q, R, J]       = randlapack.bqrrp(A);              % explicit (default)
+%       err             = norm(A(:, J) - Q*R, 'fro') / norm(A, 'fro');
+%       [A_out, tau, J] = randlapack.bqrrp(A, 'implicit');  % GEQP3-format
+%       R_from_impl     = triu(A_out(1:size(A, 2), :));     % R lives in upper triangle
 %
 %   See also QR.
 
