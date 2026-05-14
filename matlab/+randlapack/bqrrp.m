@@ -41,7 +41,9 @@ function [Q, R, J, state_out] = bqrrp(A, varargin)
     end
 
     % --- Optional argument defaults ---
-    b_sz     = int64(64);
+    % Default b_sz is min(m, n) so it is always in range; the user can
+    % pass a smaller value to actually exercise the blocked structure.
+    b_sz     = int64(min(m, n));
     d_factor = cast(1.25, class(A));
     state    = make_default_state();
 
