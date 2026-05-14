@@ -1,235 +1,287 @@
-// MEX wrapper for RandLAPACK::BQRRP.
+// MEX wrapper for RandLAPACK::BQRRP using MATLAB's C++ Data API (R2018a+).
 //
 // MATLAB-side signature (low-level; users normally call randlapack.bqrrp.m):
 //
-//   [Q, R, J, state_out] = bqrrp_mex(A, b_sz, d_factor, state_in)
+//   [out1, out2, J, state_out] = bqrrp_mex(A, b_sz, d_factor, state, mode)
 //
-// where:
-//   A         m-by-n matrix, single or double, column-major (MATLAB default).
-//   b_sz      block size; scalar, converted to int64.
-//   d_factor  sketch factor; scalar of the same scalar type as A.
-//   state_in  RNG state struct with fields .counter (uint32 length 4) and
-//             .key (uint32 length 2). Philox4x32 layout.
+// where mode is 'explicit' or 'implicit'.
 //
-// returns:
-//   Q          m-by-k explicit orthogonal factor, k = min(m, n).
-//   R          k-by-n upper-triangular factor.
-//   J          1-by-n vector of 1-based column-pivot indices (int64).
-//   state_out  RNG state struct after advancing.
+// 'explicit' (default in the .m wrapper):
+//   out1 = Q (m-by-k explicit orthogonal factor, k = min(m, n))
+//   out2 = R (k-by-n upper-triangular factor)
 //
-// J is 1-based because BQRRP itself stores 1-based pivot indices internally
-// (see RandLAPACK/RandLAPACK/drivers/rl_bqrrp.hh, std::iota(..., 1) at line
-// 330). No conversion is performed in the MEX layer.
+// 'implicit':
+//   out1 = A_out (m-by-n, BQRRP's native GEQP3-format: Householder vectors
+//                  below the diagonal, R in and above the diagonal)
+//   out2 = tau   (length-n vector of Householder scalars)
+//
+// Other outputs:
+//   J          1-by-n vector of 1-based column-pivot indices (int64)
+//   state_out  RNG state struct after advancing
+//
+// J is 1-based because BQRRP itself stores 1-based pivots internally
+// (rl_bqrrp.hh:330: std::iota(..., 1)). No conversion in the MEX layer.
 
-#include "mex.h"
+#include "mex.hpp"
+#include "mexAdapter.hpp"
+
 #include <RandLAPACK.hh>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <memory>
+#include <string>
 #include <type_traits>
 #include <vector>
 
-namespace {
+using matlab::mex::ArgumentList;
+using matlab::data::Array;
+using matlab::data::ArrayFactory;
+using matlab::data::ArrayType;
+using matlab::data::CharArray;
+using matlab::data::StructArray;
+template <typename T> using TypedArray = matlab::data::TypedArray<T>;
 
-using RNG = RandBLAS::DefaultRNG;  // Philox4x32
 
-constexpr mwSize CTR_LEN = 4;
-constexpr mwSize KEY_LEN = 2;
+class MexFunction : public matlab::mex::Function {
+private:
+    using RNG = RandBLAS::DefaultRNG;
+    static constexpr size_t CTR_LEN = 4;
+    static constexpr size_t KEY_LEN = 2;
 
-RandBLAS::RNGState<RNG> read_state(const mxArray* state_struct) {
-    if (!mxIsStruct(state_struct)) {
-        mexErrMsgIdAndTxt("randlapack:bqrrp_mex:state",
-            "state must be a struct with .counter (uint32[4]) and .key (uint32[2])");
-    }
-    const mxArray* counter_field = mxGetField(state_struct, 0, "counter");
-    const mxArray* key_field     = mxGetField(state_struct, 0, "key");
-    if (!counter_field || !mxIsUint32(counter_field)
-        || mxGetNumberOfElements(counter_field) != CTR_LEN) {
-        mexErrMsgIdAndTxt("randlapack:bqrrp_mex:state",
-            "state.counter must be a uint32 array of length 4");
-    }
-    if (!key_field || !mxIsUint32(key_field)
-        || mxGetNumberOfElements(key_field) != KEY_LEN) {
-        mexErrMsgIdAndTxt("randlapack:bqrrp_mex:state",
-            "state.key must be a uint32 array of length 2");
-    }
+    std::shared_ptr<matlab::engine::MATLABEngine> matlabPtr;
+    ArrayFactory factory;
 
-    RandBLAS::RNGState<RNG> state;
-    const uint32_t* ctr_in = (const uint32_t*) mxGetData(counter_field);
-    const uint32_t* key_in = (const uint32_t*) mxGetData(key_field);
-    for (mwSize i = 0; i < CTR_LEN; ++i) state.counter.v[i] = ctr_in[i];
-    for (mwSize i = 0; i < KEY_LEN; ++i) state.key.v[i]     = key_in[i];
-    return state;
-}
-
-mxArray* write_state(const RandBLAS::RNGState<RNG>& state) {
-    const char* fields[] = {"counter", "key"};
-    mxArray* out = mxCreateStructMatrix(1, 1, 2, fields);
-
-    mxArray* counter_mx = mxCreateNumericMatrix(1, CTR_LEN, mxUINT32_CLASS, mxREAL);
-    uint32_t* ctr_out = (uint32_t*) mxGetData(counter_mx);
-    for (mwSize i = 0; i < CTR_LEN; ++i) ctr_out[i] = state.counter.v[i];
-    mxSetField(out, 0, "counter", counter_mx);
-
-    mxArray* key_mx = mxCreateNumericMatrix(1, KEY_LEN, mxUINT32_CLASS, mxREAL);
-    uint32_t* key_out = (uint32_t*) mxGetData(key_mx);
-    for (mwSize i = 0; i < KEY_LEN; ++i) key_out[i] = state.key.v[i];
-    mxSetField(out, 0, "key", key_mx);
-
-    return out;
-}
-
-template <typename T>
-constexpr mxClassID mx_class_for() {
-    if constexpr (std::is_same_v<T, double>) return mxDOUBLE_CLASS;
-    else if constexpr (std::is_same_v<T, float>) return mxSINGLE_CLASS;
-    else { static_assert(sizeof(T) == 0, "unsupported scalar type"); return mxUNKNOWN_CLASS; }
-}
-
-template <typename T>
-void run_bqrrp(int nlhs, mxArray* plhs[], const mxArray* A_in,
-               int64_t b_sz, T d_factor, const mxArray* state_in,
-               bool implicit)
-{
-    const int64_t m = (int64_t) mxGetM(A_in);
-    const int64_t n = (int64_t) mxGetN(A_in);
-    const int64_t k = std::min(m, n);
-    const T* A_data = (const T*) mxGetData(A_in);
-
-    // BQRRP overwrites A; copy into a mutable scratch buffer.
-    std::vector<T> A_work((size_t) m * (size_t) n);
-    std::memcpy(A_work.data(), A_data, sizeof(T) * (size_t) m * (size_t) n);
-
-    // Per BQRRP's docstring, tau has size n.
-    std::vector<T> tau(std::max((int64_t) 1, n));
-    std::vector<int64_t> J(std::max((int64_t) 1, n));
-
-    auto state = read_state(state_in);
-
-    RandLAPACK::BQRRP<T, RNG> alg(false, b_sz);
-    int ret = alg.call(m, n, A_work.data(), m, d_factor, tau.data(), J.data(), state);
-    if (ret != 0) {
-        mexErrMsgIdAndTxt("randlapack:bqrrp_mex:returnCode",
-            "BQRRP returned non-zero status %d", ret);
+    // Raise a MATLAB error with a given identifier and message. Delegates to
+    // MATLAB's `error` builtin via feval, which raises a MATLABException that
+    // propagates back through the MEX boundary.
+    [[noreturn]] void raise(const std::string& id, const std::string& msg) {
+        matlabPtr->feval(u"error", 0, std::vector<Array>{
+            factory.createCharArray(id),
+            factory.createCharArray(msg)
+        });
+        std::terminate();  // feval(error) does not return; this is a backstop.
     }
 
-    if (implicit) {
-        // Implicit mode: return BQRRP's native GEQP3-format outputs.
-        // A_out (m-by-n) carries Householder vectors below the diagonal and
-        // the upper-triangular R factor in and above the diagonal; tau is the
-        // n-vector of Householder scalars. Q is not materialized (no ungqr).
-        plhs[0] = mxCreateNumericMatrix((mwSize) m, (mwSize) n, mx_class_for<T>(), mxREAL);
-        std::memcpy(mxGetData(plhs[0]), A_work.data(),
-                    sizeof(T) * (size_t) m * (size_t) n);
+    RandBLAS::RNGState<RNG> read_state(const Array& state_arr) {
+        if (state_arr.getType() != ArrayType::STRUCT) {
+            raise("randlapack:bqrrp_mex:state",
+                "state must be a struct with .counter (uint32[4]) and .key (uint32[2])");
+        }
+        StructArray s = state_arr;
+        if (s.getNumberOfElements() == 0) {
+            raise("randlapack:bqrrp_mex:state", "state struct must be nonempty");
+        }
+        Array ctr_field = s[0]["counter"];
+        Array key_field = s[0]["key"];
+        if (ctr_field.getType() != ArrayType::UINT32
+            || ctr_field.getNumberOfElements() != CTR_LEN) {
+            raise("randlapack:bqrrp_mex:state",
+                "state.counter must be a uint32 array of length 4");
+        }
+        if (key_field.getType() != ArrayType::UINT32
+            || key_field.getNumberOfElements() != KEY_LEN) {
+            raise("randlapack:bqrrp_mex:state",
+                "state.key must be a uint32 array of length 2");
+        }
+        TypedArray<uint32_t> ctr = std::move(ctr_field);
+        TypedArray<uint32_t> key = std::move(key_field);
+        RandBLAS::RNGState<RNG> state;
+        for (size_t i = 0; i < CTR_LEN; ++i) state.counter.v[i] = ctr[i];
+        for (size_t i = 0; i < KEY_LEN; ++i) state.key.v[i]     = key[i];
+        return state;
+    }
 
-        plhs[1] = mxCreateNumericMatrix(1, (mwSize) n, mx_class_for<T>(), mxREAL);
-        std::memcpy(mxGetData(plhs[1]), tau.data(), sizeof(T) * (size_t) n);
-    } else {
-        // Explicit mode: extract R, then materialize Q via ungqr.
-        // Order matters: ungqr clobbers the upper triangle of A_work, so we
-        // copy R out before calling it.
-        plhs[1] = mxCreateNumericMatrix((mwSize) k, (mwSize) n, mx_class_for<T>(), mxREAL);
-        T* R_out = (T*) mxGetData(plhs[1]);
-        for (int64_t j = 0; j < n; ++j) {
-            const int64_t lim = std::min(j + 1, k);
-            for (int64_t i = 0; i < lim; ++i) {
-                R_out[i + j * k] = A_work[i + j * m];
-            }
-            for (int64_t i = lim; i < k; ++i) {
-                R_out[i + j * k] = (T) 0;
+    Array write_state(const RandBLAS::RNGState<RNG>& state) {
+        StructArray out = factory.createStructArray({1, 1}, {"counter", "key"});
+        TypedArray<uint32_t> ctr = factory.createArray<uint32_t>({1, CTR_LEN});
+        TypedArray<uint32_t> key = factory.createArray<uint32_t>({1, KEY_LEN});
+        for (size_t i = 0; i < CTR_LEN; ++i) ctr[i] = state.counter.v[i];
+        for (size_t i = 0; i < KEY_LEN; ++i) key[i] = state.key.v[i];
+        out[0]["counter"] = std::move(ctr);
+        out[0]["key"]     = std::move(key);
+        return out;
+    }
+
+    template <typename T>
+    void run_bqrrp(ArgumentList& outputs, ArgumentList& inputs,
+                   int64_t b_sz, double d_factor_in, bool implicit)
+    {
+        const Array& A_in = inputs[0];
+        auto dims = A_in.getDimensions();
+        const int64_t m = static_cast<int64_t>(dims[0]);
+        const int64_t n = static_cast<int64_t>(dims[1]);
+        const int64_t k = std::min(m, n);
+        const T d_factor = static_cast<T>(d_factor_in);
+
+        // BQRRP overwrites A; copy into a mutable scratch buffer (column-major,
+        // matching MATLAB's storage layout).
+        std::vector<T> A_work(static_cast<size_t>(m) * static_cast<size_t>(n));
+        TypedArray<T> A_typed = A_in;
+        {
+            size_t idx = 0;
+            for (const auto v : A_typed) {
+                A_work[idx++] = v;
             }
         }
 
-        int64_t info = lapack::ungqr(m, k, k, A_work.data(), m, tau.data());
-        if (info != 0) {
-            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:ungqr",
-                "lapack::ungqr returned info=%lld while forming explicit Q",
-                (long long) info);
+        std::vector<T> tau(std::max<int64_t>(1, n));
+        std::vector<int64_t> J(std::max<int64_t>(1, n));
+
+        auto state = read_state(inputs[3]);
+
+        RandLAPACK::BQRRP<T, RNG> alg(false, b_sz);
+        int ret = alg.call(m, n, A_work.data(), m, d_factor, tau.data(),
+                           J.data(), state);
+        if (ret != 0) {
+            raise("randlapack:bqrrp_mex:returnCode",
+                "BQRRP returned non-zero status " + std::to_string(ret));
         }
 
-        plhs[0] = mxCreateNumericMatrix((mwSize) m, (mwSize) k, mx_class_for<T>(), mxREAL);
-        std::memcpy(mxGetData(plhs[0]), A_work.data(),
-                    sizeof(T) * (size_t) m * (size_t) k);
-    }
+        if (implicit) {
+            // out1 = A_out (m-by-n, GEQP3-format); out2 = tau (length n).
+            auto A_buf = factory.createBuffer<T>(
+                static_cast<size_t>(m) * static_cast<size_t>(n));
+            std::memcpy(A_buf.get(), A_work.data(),
+                        sizeof(T) * static_cast<size_t>(m)
+                                  * static_cast<size_t>(n));
+            outputs[0] = factory.createArrayFromBuffer<T>(
+                {static_cast<size_t>(m), static_cast<size_t>(n)},
+                std::move(A_buf));
 
-    // J is already 1-based per BQRRP convention; pass through unchanged.
-    plhs[2] = mxCreateNumericMatrix(1, (mwSize) n, mxINT64_CLASS, mxREAL);
-    std::memcpy(mxGetData(plhs[2]), J.data(), sizeof(int64_t) * (size_t) n);
-
-    if (nlhs >= 4) {
-        plhs[3] = write_state(state);
-    }
-}
-
-}  // namespace
-
-void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
-    try {
-        if (nrhs != 5) {
-            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:nargin",
-                "Expected 5 input arguments: A, b_sz, d_factor, state, mode");
-        }
-        if (nlhs < 3 || nlhs > 4) {
-            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:nargout",
-                "Expected 3 or 4 output arguments");
-        }
-
-        const mxArray* A_in = prhs[0];
-        if (!mxIsNumeric(A_in) || mxIsComplex(A_in)
-            || mxGetNumberOfDimensions(A_in) != 2) {
-            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:A",
-                "A must be a real 2D numeric matrix (single or double)");
-        }
-        if (!mxIsScalar(prhs[1])) {
-            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:b_sz", "b_sz must be scalar");
-        }
-        const int64_t b_sz = (int64_t) mxGetScalar(prhs[1]);
-
-        if (!mxIsScalar(prhs[2])) {
-            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:d_factor", "d_factor must be scalar");
-        }
-
-        const mxArray* state_in = prhs[3];
-
-        // Mode: 'explicit' (materialize Q) or 'implicit' (GEQP3-format).
-        if (!mxIsChar(prhs[4])) {
-            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:mode",
-                "mode must be a string ('explicit' or 'implicit')");
-        }
-        char mode_buf[16] = {0};
-        if (mxGetString(prhs[4], mode_buf, sizeof(mode_buf)) != 0) {
-            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:mode",
-                "could not read mode string (too long?)");
-        }
-        bool implicit;
-        if (std::strcmp(mode_buf, "explicit") == 0) {
-            implicit = false;
-        } else if (std::strcmp(mode_buf, "implicit") == 0) {
-            implicit = true;
+            auto tau_buf = factory.createBuffer<T>(static_cast<size_t>(n));
+            std::memcpy(tau_buf.get(), tau.data(),
+                        sizeof(T) * static_cast<size_t>(n));
+            outputs[1] = factory.createArrayFromBuffer<T>(
+                {1, static_cast<size_t>(n)}, std::move(tau_buf));
         } else {
-            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:mode",
-                "mode must be 'explicit' or 'implicit'; got '%s'", mode_buf);
+            // out1 = Q (m-by-k explicit); out2 = R (k-by-n).
+            // Order matters: ungqr clobbers the upper triangle of A_work, so
+            // copy R out first.
+            auto R_buf = factory.createBuffer<T>(
+                static_cast<size_t>(k) * static_cast<size_t>(n));
+            T* R_data = R_buf.get();
+            for (int64_t j = 0; j < n; ++j) {
+                const int64_t lim = std::min(j + 1, k);
+                for (int64_t i = 0; i < lim; ++i) {
+                    R_data[i + j * k] = A_work[i + j * m];
+                }
+                for (int64_t i = lim; i < k; ++i) {
+                    R_data[i + j * k] = static_cast<T>(0);
+                }
+            }
+            outputs[1] = factory.createArrayFromBuffer<T>(
+                {static_cast<size_t>(k), static_cast<size_t>(n)},
+                std::move(R_buf));
+
+            int64_t info = lapack::ungqr(m, k, k, A_work.data(), m, tau.data());
+            if (info != 0) {
+                raise("randlapack:bqrrp_mex:ungqr",
+                    "lapack::ungqr returned info=" + std::to_string(info));
+            }
+
+            auto Q_buf = factory.createBuffer<T>(
+                static_cast<size_t>(m) * static_cast<size_t>(k));
+            std::memcpy(Q_buf.get(), A_work.data(),
+                        sizeof(T) * static_cast<size_t>(m)
+                                  * static_cast<size_t>(k));
+            outputs[0] = factory.createArrayFromBuffer<T>(
+                {static_cast<size_t>(m), static_cast<size_t>(k)},
+                std::move(Q_buf));
         }
 
-        if (mxIsDouble(A_in)) {
-            const double d_factor = mxGetScalar(prhs[2]);
-            run_bqrrp<double>(nlhs, plhs, A_in, b_sz, d_factor, state_in, implicit);
-        } else if (mxIsSingle(A_in)) {
-            const float d_factor = (float) mxGetScalar(prhs[2]);
-            run_bqrrp<float>(nlhs, plhs, A_in, b_sz, d_factor, state_in, implicit);
-        } else {
-            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:type",
-                "A must be single or double");
+        // J: 1-based int64 row vector.
+        auto J_buf = factory.createBuffer<int64_t>(static_cast<size_t>(n));
+        std::memcpy(J_buf.get(), J.data(), sizeof(int64_t) * static_cast<size_t>(n));
+        outputs[2] = factory.createArrayFromBuffer<int64_t>(
+            {1, static_cast<size_t>(n)}, std::move(J_buf));
+
+        if (outputs.size() >= 4) {
+            outputs[3] = write_state(state);
         }
-    } catch (const RandLAPACK::Error& e) {
-        mexErrMsgIdAndTxt("randlapack:bqrrp_mex:RandLAPACKError", "%s", e.what());
-    } catch (const RandBLAS::Error& e) {
-        mexErrMsgIdAndTxt("randlapack:bqrrp_mex:RandBLASError", "%s", e.what());
-    } catch (const std::exception& e) {
-        mexErrMsgIdAndTxt("randlapack:bqrrp_mex:StdError", "%s", e.what());
-    } catch (...) {
-        mexErrMsgIdAndTxt("randlapack:bqrrp_mex:Unknown",
-            "Unknown exception in bqrrp_mex");
     }
-}
+
+public:
+    MexFunction() : matlabPtr(getEngine()) {}
+
+    void operator()(ArgumentList outputs, ArgumentList inputs) {
+        try {
+            if (inputs.size() != 5) {
+                raise("randlapack:bqrrp_mex:nargin",
+                    "Expected 5 input arguments: A, b_sz, d_factor, state, mode");
+            }
+            if (outputs.size() < 3 || outputs.size() > 4) {
+                raise("randlapack:bqrrp_mex:nargout",
+                    "Expected 3 or 4 output arguments");
+            }
+
+            const Array& A_in = inputs[0];
+            if (A_in.getDimensions().size() != 2) {
+                raise("randlapack:bqrrp_mex:A",
+                    "A must be a 2D real numeric matrix (single or double)");
+            }
+            const ArrayType A_type = A_in.getType();
+            if (A_type != ArrayType::DOUBLE && A_type != ArrayType::SINGLE) {
+                raise("randlapack:bqrrp_mex:type", "A must be single or double");
+            }
+
+            const Array& b_sz_arr = inputs[1];
+            if (b_sz_arr.getNumberOfElements() != 1
+                || b_sz_arr.getType() != ArrayType::INT64) {
+                raise("randlapack:bqrrp_mex:b_sz",
+                    "b_sz must be an int64 scalar");
+            }
+            const int64_t b_sz = TypedArray<int64_t>(b_sz_arr)[0];
+
+            const Array& d_factor_arr = inputs[2];
+            if (d_factor_arr.getNumberOfElements() != 1) {
+                raise("randlapack:bqrrp_mex:d_factor", "d_factor must be scalar");
+            }
+            double d_factor;
+            if (d_factor_arr.getType() == ArrayType::DOUBLE) {
+                d_factor = static_cast<double>(TypedArray<double>(d_factor_arr)[0]);
+            } else if (d_factor_arr.getType() == ArrayType::SINGLE) {
+                d_factor = static_cast<double>(TypedArray<float>(d_factor_arr)[0]);
+            } else {
+                raise("randlapack:bqrrp_mex:d_factor",
+                    "d_factor must be a single or double scalar");
+            }
+
+            const Array& mode_arr = inputs[4];
+            if (mode_arr.getType() != ArrayType::CHAR) {
+                raise("randlapack:bqrrp_mex:mode",
+                    "mode must be a character vector ('explicit' or 'implicit')");
+            }
+            const std::string mode = CharArray(mode_arr).toAscii();
+            bool implicit;
+            if (mode == "explicit") {
+                implicit = false;
+            } else if (mode == "implicit") {
+                implicit = true;
+            } else {
+                raise("randlapack:bqrrp_mex:mode",
+                    "mode must be 'explicit' or 'implicit'; got '" + mode + "'");
+            }
+
+            if (A_type == ArrayType::DOUBLE) {
+                run_bqrrp<double>(outputs, inputs, b_sz, d_factor, implicit);
+            } else {
+                run_bqrrp<float>(outputs, inputs, b_sz, d_factor, implicit);
+            }
+        } catch (const RandLAPACK::Error& e) {
+            raise("randlapack:bqrrp_mex:RandLAPACKError", e.what());
+        } catch (const RandBLAS::Error& e) {
+            raise("randlapack:bqrrp_mex:RandBLASError", e.what());
+        } catch (const matlab::Exception&) {
+            // MATLAB exceptions (typically from feval(error)) propagate through
+            // unchanged so MATLAB sees the original error ID and message.
+            throw;
+        } catch (const std::exception& e) {
+            raise("randlapack:bqrrp_mex:StdError", e.what());
+        } catch (...) {
+            raise("randlapack:bqrrp_mex:Unknown",
+                  "Unknown exception in bqrrp_mex");
+        }
+    }
+};
