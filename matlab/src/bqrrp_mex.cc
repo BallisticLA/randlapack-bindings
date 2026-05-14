@@ -89,7 +89,8 @@ constexpr mxClassID mx_class_for() {
 
 template <typename T>
 void run_bqrrp(int nlhs, mxArray* plhs[], const mxArray* A_in,
-               int64_t b_sz, T d_factor, const mxArray* state_in)
+               int64_t b_sz, T d_factor, const mxArray* state_in,
+               bool implicit)
 {
     const int64_t m = (int64_t) mxGetM(A_in);
     const int64_t n = (int64_t) mxGetN(A_in);
@@ -113,29 +114,44 @@ void run_bqrrp(int nlhs, mxArray* plhs[], const mxArray* A_in,
             "BQRRP returned non-zero status %d", ret);
     }
 
-    // R first: orgqr will clobber the upper triangle when materializing Q.
-    plhs[1] = mxCreateNumericMatrix((mwSize) k, (mwSize) n, mx_class_for<T>(), mxREAL);
-    T* R_out = (T*) mxGetData(plhs[1]);
-    for (int64_t j = 0; j < n; ++j) {
-        const int64_t lim = std::min(j + 1, k);
-        for (int64_t i = 0; i < lim; ++i) {
-            R_out[i + j * k] = A_work[i + j * m];
-        }
-        for (int64_t i = lim; i < k; ++i) {
-            R_out[i + j * k] = (T) 0;
-        }
-    }
+    if (implicit) {
+        // Implicit mode: return BQRRP's native GEQP3-format outputs.
+        // A_out (m-by-n) carries Householder vectors below the diagonal and
+        // the upper-triangular R factor in and above the diagonal; tau is the
+        // n-vector of Householder scalars. Q is not materialized (no ungqr).
+        plhs[0] = mxCreateNumericMatrix((mwSize) m, (mwSize) n, mx_class_for<T>(), mxREAL);
+        std::memcpy(mxGetData(plhs[0]), A_work.data(),
+                    sizeof(T) * (size_t) m * (size_t) n);
 
-    // Form explicit Q (m-by-k) in place via LAPACK++'s ungqr (== orgqr for real T).
-    int64_t info = lapack::ungqr(m, k, k, A_work.data(), m, tau.data());
-    if (info != 0) {
-        mexErrMsgIdAndTxt("randlapack:bqrrp_mex:ungqr",
-            "lapack::ungqr returned info=%lld while forming explicit Q",
-            (long long) info);
-    }
+        plhs[1] = mxCreateNumericMatrix(1, (mwSize) n, mx_class_for<T>(), mxREAL);
+        std::memcpy(mxGetData(plhs[1]), tau.data(), sizeof(T) * (size_t) n);
+    } else {
+        // Explicit mode: extract R, then materialize Q via ungqr.
+        // Order matters: ungqr clobbers the upper triangle of A_work, so we
+        // copy R out before calling it.
+        plhs[1] = mxCreateNumericMatrix((mwSize) k, (mwSize) n, mx_class_for<T>(), mxREAL);
+        T* R_out = (T*) mxGetData(plhs[1]);
+        for (int64_t j = 0; j < n; ++j) {
+            const int64_t lim = std::min(j + 1, k);
+            for (int64_t i = 0; i < lim; ++i) {
+                R_out[i + j * k] = A_work[i + j * m];
+            }
+            for (int64_t i = lim; i < k; ++i) {
+                R_out[i + j * k] = (T) 0;
+            }
+        }
 
-    plhs[0] = mxCreateNumericMatrix((mwSize) m, (mwSize) k, mx_class_for<T>(), mxREAL);
-    std::memcpy(mxGetData(plhs[0]), A_work.data(), sizeof(T) * (size_t) m * (size_t) k);
+        int64_t info = lapack::ungqr(m, k, k, A_work.data(), m, tau.data());
+        if (info != 0) {
+            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:ungqr",
+                "lapack::ungqr returned info=%lld while forming explicit Q",
+                (long long) info);
+        }
+
+        plhs[0] = mxCreateNumericMatrix((mwSize) m, (mwSize) k, mx_class_for<T>(), mxREAL);
+        std::memcpy(mxGetData(plhs[0]), A_work.data(),
+                    sizeof(T) * (size_t) m * (size_t) k);
+    }
 
     // J is already 1-based per BQRRP convention; pass through unchanged.
     plhs[2] = mxCreateNumericMatrix(1, (mwSize) n, mxINT64_CLASS, mxREAL);
@@ -150,9 +166,9 @@ void run_bqrrp(int nlhs, mxArray* plhs[], const mxArray* A_in,
 
 void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
     try {
-        if (nrhs != 4) {
+        if (nrhs != 5) {
             mexErrMsgIdAndTxt("randlapack:bqrrp_mex:nargin",
-                "Expected 4 input arguments: A, b_sz, d_factor, state");
+                "Expected 5 input arguments: A, b_sz, d_factor, state, mode");
         }
         if (nlhs < 3 || nlhs > 4) {
             mexErrMsgIdAndTxt("randlapack:bqrrp_mex:nargout",
@@ -176,12 +192,32 @@ void mexFunction(int nlhs, mxArray* plhs[], int nrhs, const mxArray* prhs[]) {
 
         const mxArray* state_in = prhs[3];
 
+        // Mode: 'explicit' (materialize Q) or 'implicit' (GEQP3-format).
+        if (!mxIsChar(prhs[4])) {
+            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:mode",
+                "mode must be a string ('explicit' or 'implicit')");
+        }
+        char mode_buf[16] = {0};
+        if (mxGetString(prhs[4], mode_buf, sizeof(mode_buf)) != 0) {
+            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:mode",
+                "could not read mode string (too long?)");
+        }
+        bool implicit;
+        if (std::strcmp(mode_buf, "explicit") == 0) {
+            implicit = false;
+        } else if (std::strcmp(mode_buf, "implicit") == 0) {
+            implicit = true;
+        } else {
+            mexErrMsgIdAndTxt("randlapack:bqrrp_mex:mode",
+                "mode must be 'explicit' or 'implicit'; got '%s'", mode_buf);
+        }
+
         if (mxIsDouble(A_in)) {
             const double d_factor = mxGetScalar(prhs[2]);
-            run_bqrrp<double>(nlhs, plhs, A_in, b_sz, d_factor, state_in);
+            run_bqrrp<double>(nlhs, plhs, A_in, b_sz, d_factor, state_in, implicit);
         } else if (mxIsSingle(A_in)) {
             const float d_factor = (float) mxGetScalar(prhs[2]);
-            run_bqrrp<float>(nlhs, plhs, A_in, b_sz, d_factor, state_in);
+            run_bqrrp<float>(nlhs, plhs, A_in, b_sz, d_factor, state_in, implicit);
         } else {
             mexErrMsgIdAndTxt("randlapack:bqrrp_mex:type",
                 "A must be single or double");
