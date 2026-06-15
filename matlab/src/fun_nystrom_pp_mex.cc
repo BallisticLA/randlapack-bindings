@@ -65,6 +65,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdint>
+#include <cstring>
 #include <functional>
 #include <string>
 #include <vector>
@@ -122,14 +123,16 @@ private:
     }
 
     // Copy a TypedArray<T> column-major into a contiguous std::vector<T>.
+    // MATLAB arrays are column-major and contiguous, so we bulk-copy the whole
+    // buffer in one shot. The previous per-element iterator loop was a measured
+    // marshal bottleneck at large n (the n^2 element-by-element copy dominated
+    // input handling); &*begin() is the contiguous storage of a full array, so
+    // a single memcpy replaces the O(n_elems) iterator loop.
     template <typename T>
     void copy_into(const Array& in, std::vector<T>& out, size_t n_elems) {
         out.resize(n_elems);
         TypedArray<T> typed = in;
-        size_t idx = 0;
-        for (const auto v : typed) {
-            out[idx++] = v;
-        }
+        std::memcpy(out.data(), &*typed.begin(), n_elems * sizeof(T));
     }
 
     // Templated worker: reads the T-typed matrices, builds the f(A)*X oracle,
