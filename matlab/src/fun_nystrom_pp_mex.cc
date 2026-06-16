@@ -3,15 +3,19 @@
 //
 // MATLAB-side signature (low-level; users normally call randlapack.fun_nystrom_pp.m):
 //
-//   [est, t1, t2] = fun_nystrom_pp_mex(A, Omega1, Omega2, func, q, poly_lambda, lfa_type, d, ...
+//   [est, t1, t2] = fun_nystrom_pp_mex(A, arg1, arg2, func, q, poly_lambda, lfa_type, d, ...
 //                                      sketch_type, vec_nnz, sketch_seed)
 //
 // where:
 //   A           n x n matrix, single or double, column-major (symmetric, upper triangle used;
 //               for sketch_type 'saso' BOTH triangles are used — the MEX mirrors upper->lower)
-//   Omega1      n x k matrix, same class as A. For sketch_type 'saso' only its SIZE is read
-//               (defines k); the Phase-1 sketch itself is a sparse operator sampled in C++.
-//   Omega2      n x s matrix, same class as A (may be empty if k == n; Phase 2 then skipped)
+//   arg1        Phase-1 sketch, seed-driven: pass a SCALAR k (the rank) to sample the sketch
+//               internally from sketch_seed (Gaussian via DenseSkOp, or SASO per sketch_type),
+//               OR pass an explicit n x k matrix (same class as A) to use it as the sketch
+//               (escape hatch for validation/reproducibility). For SASO only k matters.
+//   arg2        Phase-2 Hutchinson probes: pass a SCALAR s to sample n x s Gaussian probes
+//               internally (seed = sketch_seed + 1000), OR an explicit n x s matrix.
+//               Phase 2 is skipped when k == n (arg2 then unread).
 //   func        'sqrt' | 'log' | 'poly' | 'effdim' | 'square' | 'identity'
 //                 poly:   f(x) = x(x + poly_lambda)
 //                 effdim: f(x) = x/(x + poly_lambda)   ("effective dimension"; operator monotone)
@@ -139,47 +143,29 @@ private:
     // and drives FunNystromPP<T>. T is double or float (dispatched in operator()).
     template <typename T>
     void run_fun_nystrom(ArgumentList& outputs, ArgumentList& inputs) {
-        // --- input marshal (timed: candidate MEX-boundary bottleneck) ---
+        // --- input prep (timed). Seed-driven API: inputs 2 and 3 are EITHER a
+        // scalar (the sketch SIZE, sampled internally here from sketch_seed) OR
+        // an explicit dense sketch matrix (escape hatch for validation/repro).
+        // The driver always receives plain buffers, so it is untouched. ---
         const auto t_marshal_start = std::chrono::steady_clock::now();
+        using RNG = r123::Philox4x32;
 
-        // --- A: n x n ---
+        // A: n x n
         const Array& A_in = inputs[0];
         const int64_t n = static_cast<int64_t>(A_in.getDimensions()[0]);
         std::vector<T> A_buf;
         copy_into<T>(A_in, A_buf, static_cast<size_t>(n) * n);
 
-        // --- Omega1: n x k ---
-        const Array& O1_in = inputs[1];
-        const int64_t k = static_cast<int64_t>(O1_in.getDimensions()[1]);
-        std::vector<T> O1_buf;
-        copy_into<T>(O1_in, O1_buf, static_cast<size_t>(n) * k);
-
-        // --- Omega2: n x s (may be empty when k == n) ---
-        const Array& O2_in = inputs[2];
-        const bool phase2_skipped = (k == n);
-        int64_t s = 0;
-        std::vector<T> O2_buf;
-        if (!phase2_skipped) {
-            s = static_cast<int64_t>(O2_in.getDimensions()[1]);
-            copy_into<T>(O2_in, O2_buf, static_cast<size_t>(n) * s);
-        }
-
-        const double marshal_in_ms = std::chrono::duration<double, std::milli>(
-            std::chrono::steady_clock::now() - t_marshal_start).count();
-
-        // --- scalar params ---
+        // scalar params (read before sketch handling: internal sampling needs them)
         const std::string func        = read_string(inputs[3], "func");
         const int64_t     q           = read_int   (inputs[4], "q");
         const T           poly_lambda = static_cast<T>(read_double(inputs[5], "poly_lambda"));
         const std::string lfa_type    = read_string(inputs[6], "lfa_type");
         const int64_t     d           = read_int   (inputs[7], "d");
-        // Optional sketch controls (inputs 9-11; default to the dense-Gaussian path).
         const std::string sketch_type = (inputs.size() >= 9)  ? read_string(inputs[8], "sketch_type") : "gaussian";
         const int64_t     vec_nnz     = (inputs.size() >= 10) ? read_int(inputs[9],  "vec_nnz")     : 8;
         const int64_t     sketch_seed = (inputs.size() >= 11) ? read_int(inputs[10], "sketch_seed") : 42;
         // Optional input 12: Lanczos reorthogonalization flag (default 1 = full).
-        // 0 = no reorth: same quadrature estimates to ~1e-15 (Druskin-
-        // Knizhnerman; validated in scope_large_n.m), ~d-fold cheaper at depth d.
         const int64_t     reorth_flag = (inputs.size() >= 12) ? read_int(inputs[11], "reorth") : 1;
 
         const bool saso_requested = (sketch_type == "saso");
@@ -187,24 +173,58 @@ private:
             raise("randlapack:fun_nystrom_pp_mex:sketch_type",
                   "unknown sketch_type '" + sketch_type + "' (use gaussian|saso)");
         }
-        // SASO dispatch (mirrors the FunNystromPP_benchmark binary):
+
+        // --- Phase-1 sketch (input 2): scalar k -> sample n x k internally;
+        // matrix -> explicit Omega1 (n x k). For SASO the sketch is sampled in
+        // C++ regardless (only k is meaningful); for Gaussian we sample a dense
+        // DenseSkOp here when given a size. ---
+        const Array& O1_in = inputs[1];
+        const bool o1_scalar = (O1_in.getNumberOfElements() == 1);
+        int64_t k;
+        std::vector<T> O1_buf;
+        if (o1_scalar) {
+            k = read_int(O1_in, "k");
+            O1_buf.assign(static_cast<size_t>(n) * k, (T)0);
+            if (!saso_requested) {
+                RandBLAS::RNGState<RNG> st(static_cast<uint32_t>(sketch_seed));
+                RandBLAS::DenseDist D1(n, k);
+                st = RandBLAS::fill_dense(D1, O1_buf.data(), st);
+            }
+        } else {
+            k = static_cast<int64_t>(O1_in.getDimensions()[1]);
+            copy_into<T>(O1_in, O1_buf, static_cast<size_t>(n) * k);
+        }
+
+        // --- Phase-2 Hutchinson probes (input 3): scalar s -> sample n x s
+        // Gaussian internally; matrix -> explicit Omega2. Skipped if k == n. ---
+        const Array& O2_in = inputs[2];
+        const bool phase2_skipped = (k == n);
+        int64_t s = 0;
+        std::vector<T> O2_buf;
+        if (!phase2_skipped) {
+            if (O2_in.getNumberOfElements() == 1) {
+                s = read_int(O2_in, "s");
+                O2_buf.assign(static_cast<size_t>(n) * s, (T)0);
+                RandBLAS::RNGState<RNG> st2(static_cast<uint32_t>(sketch_seed) + 1000u);
+                RandBLAS::DenseDist D2(n, s);
+                st2 = RandBLAS::fill_dense(D2, O2_buf.data(), st2);
+            } else {
+                s = static_cast<int64_t>(O2_in.getDimensions()[1]);
+                copy_into<T>(O2_in, O2_buf, static_cast<size_t>(n) * s);
+            }
+        }
+
+        // --- SASO dispatch (unchanged logic):
         //  - q >= 2: hand the SparseSkOp to the driver's SkOp overload (sparse
         //    right_spmm first matvec). Requires both triangles of A populated.
-        //  - q == 1 (single-pass Nystrom): there is no first matvec for the
-        //    sparse path to amortize, so densify the sampled sketch into the
-        //    Omega1 buffer and take the dense path. Same distribution, same
-        //    estimate at fixed seed as a densified SkOp.
+        //  - q == 1: no first matvec to amortize, so densify the sampled SASO
+        //    into O1_buf and take the dense path. ---
         const bool use_saso_skop = saso_requested && (q >= 2);
         if (use_saso_skop) {
-            // right_spmm reads A as generic dense (symmetry is not exploited);
-            // mirror the upper triangle into the lower so both are populated.
             for (int64_t j = 0; j < n; ++j)
                 for (int64_t i = j + 1; i < n; ++i)
                     A_buf[i + j * n] = A_buf[j + i * n];
         } else if (saso_requested) {
-            // q == 1: densify the SASO sketch into O1_buf (replaces the
-            // caller-supplied Omega1 values; only its size was meaningful).
-            using RNG = r123::Philox4x32;
             RandBLAS::RNGState<RNG> state(static_cast<uint32_t>(sketch_seed));
             auto S = RandBLAS::SparseDist(n, k, vec_nnz).template sample<T, RNG, int64_t>(state);
             RandBLAS::fill_sparse(S);
@@ -212,6 +232,9 @@ private:
             std::fill(O1_buf.begin(), O1_buf.end(), (T)0);
             RandLAPACK::util::sparse_to_dense(Scoo, Layout::ColMajor, O1_buf.data());
         }
+
+        const double marshal_in_ms = std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - t_marshal_start).count();
 
         // --- scalar function f ---
         std::function<T(T)> fscalar;
@@ -269,7 +292,6 @@ private:
             // Sparse Phase-1 sketch: sample a RandBLAS SparseSkOp and hand it to
             // the driver's SkOp overload (routes the first matvec through
             // sparse right_spmm). Omega1's values are ignored; only k was read.
-            using RNG = r123::Philox4x32;
             RandBLAS::RNGState<RNG> state(static_cast<uint32_t>(sketch_seed));
             auto S = RandBLAS::SparseDist(n, k, vec_nnz).template sample<T, RNG, int64_t>(state);
             RandBLAS::fill_sparse(S);
@@ -345,25 +367,35 @@ public:
             }
             const int64_t n = static_cast<int64_t>(A_dims[0]);
 
-            // --- Omega1 shape + class must match A ---
+            // --- arg 2 (Phase-1): scalar k (seed-driven) OR explicit n x k matrix ---
             const Array& O1_in = inputs[1];
-            auto O1_dims = O1_in.getDimensions();
-            if (O1_dims.size() != 2 || static_cast<int64_t>(O1_dims[0]) != n) {
-                raise("randlapack:fun_nystrom_pp_mex:Omega1_shape", "Omega1 must be n x k");
+            int64_t k;
+            if (O1_in.getNumberOfElements() == 1) {
+                k = read_int(O1_in, "k");        // scalar size; sketch sampled in C++
+                if (k < 1 || k > n) {
+                    raise("randlapack:fun_nystrom_pp_mex:k_range",
+                          "k (arg 2 scalar) must satisfy 1 <= k <= n");
+                }
+            } else {
+                auto O1_dims = O1_in.getDimensions();
+                if (O1_dims.size() != 2 || static_cast<int64_t>(O1_dims[0]) != n) {
+                    raise("randlapack:fun_nystrom_pp_mex:Omega1_shape",
+                          "Omega1 (arg 2 matrix) must be n x k");
+                }
+                if (O1_in.getType() != A_type) {
+                    raise("randlapack:fun_nystrom_pp_mex:Omega1_dtype",
+                          "Omega1 must be the same class (single/double) as A");
+                }
+                k = static_cast<int64_t>(O1_dims[1]);
             }
-            if (O1_in.getType() != A_type) {
-                raise("randlapack:fun_nystrom_pp_mex:Omega1_dtype",
-                      "Omega1 must be the same class (single/double) as A");
-            }
-            const int64_t k = static_cast<int64_t>(O1_dims[1]);
 
-            // --- Omega2 shape + class (only read when k < n) ---
+            // --- arg 3 (Phase-2): scalar s OR explicit n x s matrix; only when k < n ---
             const Array& O2_in = inputs[2];
-            if (k != n) {
+            if (k != n && O2_in.getNumberOfElements() != 1) {
                 auto O2_dims = O2_in.getDimensions();
                 if (O2_dims.size() != 2 || static_cast<int64_t>(O2_dims[0]) != n) {
                     raise("randlapack:fun_nystrom_pp_mex:Omega2_shape",
-                          "Omega2 must be n x s when k < n");
+                          "Omega2 (arg 3 matrix) must be n x s when k < n");
                 }
                 if (O2_in.getType() != A_type) {
                     raise("randlapack:fun_nystrom_pp_mex:Omega2_dtype",

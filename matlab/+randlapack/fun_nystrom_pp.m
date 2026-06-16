@@ -1,23 +1,27 @@
 function [est, t1, t2, times] = fun_nystrom_pp(A, Omega1, Omega2, varargin)
 %FUN_NYSTROM_PP  Trace estimator tr(f(A)) via RandLAPACK FunNystromPP.
 %
-%   est = randlapack.fun_nystrom_pp(A, Omega1, Omega2, ...)
-%   [est, t1, t2] = randlapack.fun_nystrom_pp(A, Omega1, Omega2, ...)
-%   [est, t1, t2, times] = randlapack.fun_nystrom_pp(A, Omega1, Omega2, ...)
-%       also returns a wall-clock instrumentation struct (fields:
+%   est = randlapack.fun_nystrom_pp(A, k, s, ...)            % seed-driven
+%   est = randlapack.fun_nystrom_pp(A, Omega1, Omega2, ...)  % explicit sketches
+%   [est, t1, t2, times] = randlapack.fun_nystrom_pp(...)
+%       the 4th output is a wall-clock instrumentation struct (fields:
 %       marshal_in_ms, phase1_ms, phase2_ms, fafun_ms, assembly_ms,
 %       specrec_ms, nystrom_us (1x11), lfa_us (1x5)) for performance
 %       breakdowns. See fun_nystrom_pp_mex.cc for slot definitions.
 %
 %   A        n x n matrix, single or double (symmetric; upper triangle used).
-%   Omega1   n x k matrix (Phase 1 sketch), same class as A.
-%   Omega2   n x s matrix (Phase 2 Hutchinson sketch), same class as A; may
-%            be empty when k == n, in which case Phase 2 is skipped.
+%   arg2     Phase-1 sketch. Pass a SCALAR k (the rank) and the sketch is
+%            sampled internally from SketchSeed (Gaussian, or SASO per Sketch);
+%            OR pass an explicit n x k matrix to use as the sketch.
+%   arg3     Phase-2 Hutchinson probes. Pass a SCALAR s and the n x s Gaussian
+%            probes are sampled internally; OR pass an explicit n x s matrix.
+%            Skipped when k == n (then arg3 may be a 0/[] placeholder).
 %
-%   Omega1 and Omega2 are supplied by the caller so that every estimator in a
-%   comparison study consumes the SAME randomness. For a one-off estimate you
-%   can just pass Gaussian sketches, e.g. Omega1 = randn(n, k), Omega2 =
-%   randn(n, s).
+%   The seed-driven form (sizes + SketchSeed) is the normal usage and matches
+%   the RandLAPACK / BQRRP-binding convention. The explicit-matrix form is an
+%   escape hatch for validation/reproducibility (e.g. matching a reference run
+%   that fixed Omega1/Omega2), and lets a comparison study feed every estimator
+%   the SAME randomness.
 %
 %   Optional Name-Value pairs:
 %     'Func'        char in {'sqrt', 'log', 'poly', 'effdim', 'square', 'identity'}
@@ -59,25 +63,42 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, Omega1, Omega2, varargin)
     cls = class(A);
     n   = size(A, 1);
 
-    validateattributes(Omega1, {'single', 'double'}, {'2d', 'real', 'finite'}, ...
-                       mfilename, 'Omega1', 2);
-    if size(Omega1, 1) ~= n
-        error('randlapack:fun_nystrom_pp:Omega1Shape', ...
-              'Omega1 must have n = %d rows to match A; got %d.', n, size(Omega1, 1));
+    % Args 2 and 3 are seed-driven: a SCALAR (the sketch size) samples the
+    % sketch internally in the MEX; an explicit n x <cols> MATRIX is used as the
+    % sketch (escape hatch for validation/reproducibility). a1/a2 are what we
+    % forward to the MEX (scalar size as double, or matrix cast to class(A)).
+    if isscalar(Omega1)
+        validateattributes(Omega1, {'numeric'}, {'integer', 'positive', '<=', n}, ...
+                           mfilename, 'k', 2);
+        k = double(Omega1);  a1 = double(Omega1);
+    else
+        validateattributes(Omega1, {'single', 'double'}, {'2d', 'real', 'finite'}, ...
+                           mfilename, 'Omega1', 2);
+        if size(Omega1, 1) ~= n
+            error('randlapack:fun_nystrom_pp:Omega1Shape', ...
+                  'Omega1 must have n = %d rows to match A; got %d.', n, size(Omega1, 1));
+        end
+        k = size(Omega1, 2);  a1 = cast(Omega1, cls);
     end
-    k = size(Omega1, 2);
 
-    if ~isempty(Omega2)
+    if k == n
+        a2 = double(0);                 % Phase 2 skipped; MEX leaves arg 3 unread
+    elseif isscalar(Omega2)
+        validateattributes(Omega2, {'numeric'}, {'integer', 'positive'}, ...
+                           mfilename, 's', 3);
+        a2 = double(Omega2);
+    elseif isempty(Omega2)
+        error('randlapack:fun_nystrom_pp:Omega2Empty', ...
+              ['Omega2/s may be empty only when k == n (Phase 2 skipped). ' ...
+               'Here k = %d and n = %d; pass a scalar s or an n x s sketch.'], k, n);
+    else
         validateattributes(Omega2, {'single', 'double'}, {'2d', 'real', 'finite'}, ...
                            mfilename, 'Omega2', 3);
         if size(Omega2, 1) ~= n
             error('randlapack:fun_nystrom_pp:Omega2Shape', ...
                   'Omega2 must have n = %d rows to match A; got %d.', n, size(Omega2, 1));
         end
-    elseif k ~= n
-        error('randlapack:fun_nystrom_pp:Omega2Empty', ...
-              ['Omega2 may be empty only when k == n (Phase 2 skipped). ' ...
-               'Here k = %d and n = %d; pass an n x s Phase-2 sketch.'], k, n);
+        a2 = cast(Omega2, cls);
     end
 
     % --- Name-Value options ---
@@ -110,27 +131,21 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, Omega1, Omega2, varargin)
     % MEX densifies the sampled sparse sketch internally; for Q >= 2 it routes
     % the first matvec through the sparse SkOp path.
 
-    % Keep A / Omega1 / Omega2 in one working precision (the class of A): the
-    % MEX templates on the class of A and requires the sketches to match it.
-    A      = cast(A, cls);
-    Omega1 = cast(Omega1, cls);
-    if isempty(Omega2)
-        Omega2 = zeros(n, 0, cls);   % 0-column placeholder; Phase 2 skipped iff k == n
-    else
-        Omega2 = cast(Omega2, cls);
-    end
+    % A is templated on by the MEX; keep it in the working precision. (a1/a2 were
+    % already set above: scalar size as double, or explicit sketch cast to cls.)
+    A = cast(A, cls);
 
     if nargout <= 1
-        est = fun_nystrom_pp_mex(A, Omega1, Omega2, func, q, pl, lfa_type, d, ...
+        est = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
                                  sketch, vec_nnz, sk_seed, reorth);
     elseif nargout == 2
-        [est, t1] = fun_nystrom_pp_mex(A, Omega1, Omega2, func, q, pl, lfa_type, d, ...
+        [est, t1] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
                                        sketch, vec_nnz, sk_seed, reorth);
     elseif nargout == 3
-        [est, t1, t2] = fun_nystrom_pp_mex(A, Omega1, Omega2, func, q, pl, lfa_type, d, ...
+        [est, t1, t2] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
                                            sketch, vec_nnz, sk_seed, reorth);
     else
-        [est, t1, t2, times] = fun_nystrom_pp_mex(A, Omega1, Omega2, func, q, pl, lfa_type, d, ...
+        [est, t1, t2, times] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
                                                   sketch, vec_nnz, sk_seed, reorth);
     end
 end
