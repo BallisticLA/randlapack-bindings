@@ -1,0 +1,78 @@
+name: build-randlapack-stack
+description: >
+  Build and install the RandLAPACK stack (BLAS++, Random123, LAPACK++, RandLAPACK)
+  as siblings of the checked-out bindings workspace, so the bindings can
+  find_package(RandLAPACK). Linux + macOS. Mirrors the dependency bring-up in
+  RandLAPACK's own core-linux.yaml / core-macos.yaml.
+
+inputs:
+  randlapack-ref:
+    description: RandLAPACK git ref to build the bindings against.
+    # Bump to main once FunNystromPP lands there; for now the branch that has it.
+    default: funnystrompp-v2-baseline
+
+runs:
+  using: composite
+  steps:
+    - name: base toolchain + BLAS
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          export DEBIAN_FRONTEND=noninteractive
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y git-core gcc g++ gfortran cmake m4 \
+            libgtest-dev libopenblas-openmp-dev
+        elif [ "$RUNNER_OS" = "macOS" ]; then
+          brew install googletest          # blaspp uses Apple Accelerate as BLAS
+        fi
+
+    - name: clone RandLAPACK (+ RandBLAS submodule)
+      shell: bash
+      run: |
+        cd "${{ github.workspace }}/.."
+        git clone https://github.com/BallisticLA/RandLAPACK.git
+        cd RandLAPACK
+        git checkout "${{ inputs.randlapack-ref }}"
+        git submodule update --init --recursive
+
+    - name: build + install BLAS++
+      shell: bash
+      run: |
+        cd "${{ github.workspace }}/.."
+        git clone https://github.com/icl-utk-edu/blaspp.git
+        cmake -S blaspp -B blaspp-build -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX="$PWD/blaspp-install" -Dbuild_tests=OFF
+        cmake --build blaspp-build -j2 --target install
+
+    - name: install Random123
+      shell: bash
+      run: |
+        cd "${{ github.workspace }}/.."
+        git clone https://github.com/DEShawResearch/Random123.git
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          make -C Random123 prefix="$PWD/Random123-install" install-include
+        else
+          mkdir -p Random123-install/include
+          cp -rp Random123/include/Random123 Random123-install/include/
+        fi
+
+    - name: build + install LAPACK++
+      shell: bash
+      run: |
+        cd "${{ github.workspace }}/.."
+        git clone https://github.com/icl-utk-edu/lapackpp.git
+        cmake -S lapackpp -B lapackpp-build -DCMAKE_BUILD_TYPE=Release \
+          -Dblaspp_DIR="$PWD/blaspp-install/lib/cmake/blaspp" \
+          -DCMAKE_INSTALL_PREFIX="$PWD/lapackpp-install" -Dbuild_tests=OFF
+        cmake --build lapackpp-build -j2 --target install
+
+    - name: build + install RandLAPACK (headers + cmake config; no tests built)
+      shell: bash
+      run: |
+        cd "${{ github.workspace }}/.."
+        cmake -S RandLAPACK -B RandLAPACK-build -DCMAKE_BUILD_TYPE=Release \
+          -Dblaspp_DIR="$PWD/blaspp-install/lib/cmake/blaspp" \
+          -Dlapackpp_DIR="$PWD/lapackpp-install/lib/cmake/lapackpp" \
+          -DRandom123_DIR="$PWD/Random123-install/include/" \
+          -DCMAKE_INSTALL_PREFIX="$PWD/RandLAPACK-install"
+        cmake --build RandLAPACK-build -j2 --target install
