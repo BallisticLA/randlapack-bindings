@@ -1,12 +1,13 @@
 function test_fun_nystrom_pp()
 %test_fun_nystrom_pp  Correctness checks for randlapack.fun_nystrom_pp.
 %
-% Seed-driven API. For an SPD A with known spectrum, tr(sqrt(A)) computed by
-% funNystrom++ should match the analytic trace within Hutchinson sampling error.
+% Seed-driven API; the Phase-1 sketch is always the kernel-internal SASO.
+% For an SPD A with known spectrum, tr(sqrt(A)) computed by funNystrom++
+% should match the analytic trace within Hutchinson sampling error.
 % Checks, for both single and double:
 %   * exact-oracle estimate within tolerance of sum(sqrt(eig(A)))
 %   * k == n => exact (rank-n Nystrom captures A; Phase 2 skipped) ~ machine eps
-%   * SASO sketch path runs and is sane
+%   * scalar Lanczos-FA oracle path runs and is sane
 %
 % Run: test_fun_nystrom_pp   (errors via assert on failure; for CI).
 
@@ -19,9 +20,9 @@ function test_fun_nystrom_pp()
         A = cast(Q * (lam .* Q'), cls);  A = (A + A') / 2;
         true_tr = sum(sqrt(lam));
 
-        % seed-driven, exact oracle, Gaussian sketch (k = 60, s = 40)
+        % seed-driven, exact oracle (k = 60, s = 40)
         est = randlapack.fun_nystrom_pp(A, 60, 40, 'Func', 'sqrt', 'Q', 1, ...
-                  'LFAType', 'exact', 'Sketch', 'gaussian', 'SketchSeed', 11);
+                  'LFAType', 'exact', 'SketchSeed', 11);
         rel = abs(est - true_tr) / true_tr;
         assert(isfinite(est) && rel < 5e-2, ...
                '[%s] tr(sqrt(A)) rel_err = %.2e exceeds 5e-2', cls, rel);
@@ -35,9 +36,9 @@ function test_fun_nystrom_pp()
                '[%s] k==n rel_err = %.2e exceeds %.0e (Phase-2-skip broken?)', ...
                cls, rel_full, tol_full);
 
-        % SASO sketch + scalar Lanczos-FA oracle: runs and is sane
+        % scalar Lanczos-FA oracle: runs and is sane
         est_saso = randlapack.fun_nystrom_pp(A, 60, 40, 'Func', 'sqrt', 'Q', 1, ...
-                       'LFAType', 'scalar', 'Depth', 60, 'Sketch', 'saso', ...
+                       'LFAType', 'scalar', 'Depth', 60, ...
                        'SketchSeed', 11, 'Reorth', 0);
         rel_saso = abs(est_saso - true_tr) / true_tr;
         assert(isfinite(est_saso) && rel_saso < 5e-2, ...

@@ -7,34 +7,32 @@
 //                                      sketch_type, vec_nnz, sketch_seed)
 //
 // where:
-//   A           n x n matrix, single or double, column-major (symmetric, upper triangle used;
-//               for sketch_type 'saso' BOTH triangles are used — the MEX mirrors upper->lower)
-//   arg1        Phase-1 sketch, seed-driven: pass a SCALAR k (the rank) to sample the sketch
-//               internally from sketch_seed (Gaussian via DenseSkOp, or SASO per sketch_type),
-//               OR pass an explicit n x k matrix (same class as A) to use it as the sketch
-//               (escape hatch for validation/reproducibility). For SASO only k matters.
+//   A           n x n matrix, single or double, column-major. BOTH triangles are
+//               used: the Phase-1 sketch application goes through sparse
+//               right_spmm, so the MEX mirrors upper->lower unconditionally.
+//   arg1        Phase-1 sketch SIZE: a SCALAR k (the rank). The sketch itself is
+//               a SparseStack/SASO generated INSIDE RandLAPACK::NystromEVD from
+//               (sketch_seed, vec_nnz) — matching the paper's Algorithm 1 line 1.
+//               Passing an explicit matrix is an error (the dense-sketch mode was
+//               removed from the kernel).
 //   arg2        Phase-2 Hutchinson probes: pass a SCALAR s to sample n x s Gaussian probes
 //               internally (seed = sketch_seed + 1000), OR an explicit n x s matrix.
 //               Phase 2 is skipped when k == n (arg2 then unread).
 //   func        'sqrt' | 'log' | 'poly' | 'effdim' | 'square' | 'identity'
 //                 poly:   f(x) = x(x + poly_lambda)
 //                 effdim: f(x) = x/(x + poly_lambda)   ("effective dimension"; operator monotone)
-//   q           subspace-iter count (>= 1). q = 1 is single-pass Nystrom; with
-//               sketch_type 'saso' the sketch is then densified internally
-//               (no first matvec to amortize through the sparse path).
+//   q           subspace-iter count (>= 1). q = 1 is single-pass Nystrom.
 //   poly_lambda lambda used by func 'poly' and 'effdim'
 //   lfa_type    'exact' | 'scalar' | 'block'
 //                 exact:  build f(A) once via syevd, every f(A)*X is a GEMM (validation oracle)
 //                 scalar: per-column scalar Lanczos-FA at depth d (= Lanczos quadrature per probe)
 //                 block:  block Lanczos-FA at depth d (BLAS-3 accelerated variant)
 //   d           Lanczos depth (only used for lfa_type in {scalar, block})
-//   sketch_type 'gaussian' (default) | 'saso'   [optional, input 9]
-//                 gaussian: Phase-1 sketch = the dense Omega1 passed in
-//                 saso:     Phase-1 sketch = RandBLAS SparseSkOp (sparse sketching operator,
-//                           the SparseStack-family sketch of the paper's Algorithm 1), routed
-//                           through the driver's SkOp overload (sparse right_spmm first matvec)
+//   sketch_type IGNORED (accepted for call-site compatibility; the Phase-1
+//               sketch is always the kernel-internal SASO). A MATLAB warning is
+//               issued if anything other than 'saso' is passed explicitly.
 //   vec_nnz     nonzeros per column of the SASO sketch (default 8)  [optional, input 10]
-//   sketch_seed RNG seed for the SASO sketch (default 42)           [optional, input 11]
+//   sketch_seed RNG seed for the Phase-1 sketch (default 42)        [optional, input 11]
 //
 // Outputs:
 //   est         trace estimate t1 + t2 (scalar double)
@@ -168,32 +166,19 @@ private:
         // Optional input 12: Lanczos reorthogonalization flag (default 1 = full).
         const int64_t     reorth_flag = (inputs.size() >= 12) ? read_int(inputs[11], "reorth") : 1;
 
-        const bool saso_requested = (sketch_type == "saso");
-        if (!saso_requested && sketch_type != "gaussian") {
-            raise("randlapack:fun_nystrom_pp_mex:sketch_type",
-                  "unknown sketch_type '" + sketch_type + "' (use gaussian|saso)");
+        if (inputs.size() >= 9 && sketch_type != "saso") {
+            matlabPtr->feval(u"warning", 0, std::vector<Array>{
+                factory.createCharArray("randlapack:fun_nystrom_pp_mex:sketch_type"),
+                factory.createCharArray(
+                    "sketch_type '" + sketch_type + "' ignored: the Phase-1 sketch "
+                    "is always a kernel-internal SASO now.")
+            });
         }
 
-        // --- Phase-1 sketch (input 2): scalar k -> sample n x k internally;
-        // matrix -> explicit Omega1 (n x k). For SASO the sketch is sampled in
-        // C++ regardless (only k is meaningful); for Gaussian we sample a dense
-        // DenseSkOp here when given a size. ---
-        const Array& O1_in = inputs[1];
-        const bool o1_scalar = (O1_in.getNumberOfElements() == 1);
-        int64_t k;
-        std::vector<T> O1_buf;
-        if (o1_scalar) {
-            k = read_int(O1_in, "k");
-            O1_buf.assign(static_cast<size_t>(n) * k, (T)0);
-            if (!saso_requested) {
-                RandBLAS::RNGState<RNG> st(static_cast<uint32_t>(sketch_seed));
-                RandBLAS::DenseDist D1(n, k);
-                st = RandBLAS::fill_dense(D1, O1_buf.data(), st);
-            }
-        } else {
-            k = static_cast<int64_t>(O1_in.getDimensions()[1]);
-            copy_into<T>(O1_in, O1_buf, static_cast<size_t>(n) * k);
-        }
+        // --- Phase-1 sketch (input 2): scalar k. The sketch itself (SASO) is
+        // generated inside NystromEVD from (sketch_seed, vec_nnz); explicit
+        // matrices were rejected by the validation block in operator(). ---
+        const int64_t k = read_int(inputs[1], "k");
 
         // --- Phase-2 Hutchinson probes (input 3): scalar s -> sample n x s
         // Gaussian internally; matrix -> explicit Omega2. Skipped if k == n. ---
@@ -214,24 +199,12 @@ private:
             }
         }
 
-        // --- SASO dispatch (unchanged logic):
-        //  - q >= 2: hand the SparseSkOp to the driver's SkOp overload (sparse
-        //    right_spmm first matvec). Requires both triangles of A populated.
-        //  - q == 1: no first matvec to amortize, so densify the sampled SASO
-        //    into O1_buf and take the dense path. ---
-        const bool use_saso_skop = saso_requested && (q >= 2);
-        if (use_saso_skop) {
-            for (int64_t j = 0; j < n; ++j)
-                for (int64_t i = j + 1; i < n; ++i)
-                    A_buf[i + j * n] = A_buf[j + i * n];
-        } else if (saso_requested) {
-            RandBLAS::RNGState<RNG> state(static_cast<uint32_t>(sketch_seed));
-            auto S = RandBLAS::SparseDist(n, k, vec_nnz).template sample<T, RNG, int64_t>(state);
-            RandBLAS::fill_sparse(S);
-            auto Scoo = RandBLAS::coo_view_of_skop(S);
-            std::fill(O1_buf.begin(), O1_buf.end(), (T)0);
-            RandLAPACK::util::sparse_to_dense(Scoo, Layout::ColMajor, O1_buf.data());
-        }
+        // Mirror upper triangle into lower unconditionally: the kernel's sparse
+        // first A-application goes through right_spmm, which reads A as generic
+        // dense (symmetry not exploited).
+        for (int64_t j = 0; j < n; ++j)
+            for (int64_t i = j + 1; i < n; ++i)
+                A_buf[i + j * n] = A_buf[j + i * n];
 
         const double marshal_in_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_marshal_start).count();
@@ -239,7 +212,7 @@ private:
         // --- scalar function f ---
         std::function<T(T)> fscalar;
         if      (func == "sqrt")     fscalar = [](T x) { return std::sqrt(std::max(x, (T)0)); };
-        else if (func == "log")      fscalar = [](T x) { return std::log(x); };
+        else if (func == "log")      fscalar = [](T x) { return std::log(x + (T)1); }; // log(x+1) = tr(log(A+I))
         else if (func == "poly")     fscalar = [poly_lambda](T x) { return x * (x + poly_lambda); };
         else if (func == "effdim")   fscalar = [poly_lambda](T x) { return x / (x + poly_lambda); };
         else if (func == "square")   fscalar = [](T x) { return x * x; };
@@ -285,26 +258,14 @@ private:
         block_lfa.timing  = true;
         scalar_lfa.reorth = reorth_flag;
         block_lfa.reorth  = reorth_flag;
+        driver.vec_nnz = vec_nnz;
         T t1 = (T)0, t2 = (T)0;
         const T *Omega2_ptr = phase2_skipped ? nullptr : O2_buf.data();
-        T est;
-        if (use_saso_skop) {
-            // Sparse Phase-1 sketch: sample a RandBLAS SparseSkOp and hand it to
-            // the driver's SkOp overload (routes the first matvec through
-            // sparse right_spmm). Omega1's values are ignored; only k was read.
-            RandBLAS::RNGState<RNG> state(static_cast<uint32_t>(sketch_seed));
-            auto S = RandBLAS::SparseDist(n, k, vec_nnz).template sample<T, RNG, int64_t>(state);
-            RandBLAS::fill_sparse(S);
-            est = driver.call(A_op, fAfun, fscalar,
-                              k, s, q,
-                              S, Omega2_ptr,
-                              t1, t2);
-        } else {
-            est = driver.call(A_op, fAfun, fscalar,
-                              k, s, q,
-                              O1_buf.data(), Omega2_ptr,
-                              t1, t2);
-        }
+        RandBLAS::RNGState<RNG> state(static_cast<uint32_t>(sketch_seed));
+        T est = driver.call(A_op, fAfun, fscalar,
+                            k, s, q,
+                            state, Omega2_ptr,
+                            t1, t2);
 
         outputs[0] = factory.createScalar<double>(static_cast<double>(est));
         if (outputs.size() >= 2) outputs[1] = factory.createScalar<double>(static_cast<double>(t1));
@@ -367,26 +328,22 @@ public:
             }
             const int64_t n = static_cast<int64_t>(A_dims[0]);
 
-            // --- arg 2 (Phase-1): scalar k (seed-driven) OR explicit n x k matrix ---
+            // --- arg 2 (Phase-1): scalar k only. The Phase-1 sketch is a SASO
+            // generated inside RandLAPACK::NystromEVD from (sketch_seed, vec_nnz);
+            // the explicit-matrix escape hatch was removed with the kernel's
+            // dense-sketch mode. ---
             const Array& O1_in = inputs[1];
-            int64_t k;
-            if (O1_in.getNumberOfElements() == 1) {
-                k = read_int(O1_in, "k");        // scalar size; sketch sampled in C++
-                if (k < 1 || k > n) {
-                    raise("randlapack:fun_nystrom_pp_mex:k_range",
-                          "k (arg 2 scalar) must satisfy 1 <= k <= n");
-                }
-            } else {
-                auto O1_dims = O1_in.getDimensions();
-                if (O1_dims.size() != 2 || static_cast<int64_t>(O1_dims[0]) != n) {
-                    raise("randlapack:fun_nystrom_pp_mex:Omega1_shape",
-                          "Omega1 (arg 2 matrix) must be n x k");
-                }
-                if (O1_in.getType() != A_type) {
-                    raise("randlapack:fun_nystrom_pp_mex:Omega1_dtype",
-                          "Omega1 must be the same class (single/double) as A");
-                }
-                k = static_cast<int64_t>(O1_dims[1]);
+            if (O1_in.getNumberOfElements() != 1) {
+                raise("randlapack:fun_nystrom_pp_mex:Omega1_explicit",
+                      "arg 2 must be a scalar k. Explicit Omega1 matrices are no "
+                      "longer supported: the Phase-1 sketch is a SparseStack/SASO "
+                      "generated inside RandLAPACK (control it via sketch_seed and "
+                      "vec_nnz).");
+            }
+            const int64_t k = read_int(O1_in, "k");
+            if (k < 1 || k > n) {
+                raise("randlapack:fun_nystrom_pp_mex:k_range",
+                      "k (arg 2 scalar) must satisfy 1 <= k <= n");
             }
 
             // --- arg 3 (Phase-2): scalar s OR explicit n x s matrix; only when k < n ---

@@ -1,27 +1,27 @@
-function [est, t1, t2, times] = fun_nystrom_pp(A, Omega1, Omega2, varargin)
+function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %FUN_NYSTROM_PP  Trace estimator tr(f(A)) via RandLAPACK FunNystromPP.
 %
-%   est = randlapack.fun_nystrom_pp(A, k, s, ...)            % seed-driven
-%   est = randlapack.fun_nystrom_pp(A, Omega1, Omega2, ...)  % explicit sketches
+%   est = randlapack.fun_nystrom_pp(A, k, s, ...)
+%   est = randlapack.fun_nystrom_pp(A, k, Omega2, ...)   % explicit Phase-2 probes
 %   [est, t1, t2, times] = randlapack.fun_nystrom_pp(...)
 %       the 4th output is a wall-clock instrumentation struct (fields:
 %       marshal_in_ms, phase1_ms, phase2_ms, fafun_ms, assembly_ms,
 %       specrec_ms, nystrom_us (1x11), lfa_us (1x5)) for performance
 %       breakdowns. See fun_nystrom_pp_mex.cc for slot definitions.
 %
-%   A        n x n matrix, single or double (symmetric; upper triangle used).
-%   arg2     Phase-1 sketch. Pass a SCALAR k (the rank) and the sketch is
-%            sampled internally from SketchSeed (Gaussian, or SASO per Sketch);
-%            OR pass an explicit n x k matrix to use as the sketch.
+%   A        n x n matrix, single or double (symmetric; both triangles are
+%            used by the sparse sketch application — the MEX mirrors
+%            upper->lower internally).
+%   k        Phase-1 rank (SCALAR). The Phase-1 sketch is a SparseStack/SASO
+%            generated INSIDE RandLAPACK::NystromEVD from (SketchSeed, VecNnz),
+%            matching the paper's Algorithm 1 line 1. Explicit Omega1 matrices
+%            are no longer accepted (the dense-sketch mode was removed from
+%            the kernel).
 %   arg3     Phase-2 Hutchinson probes. Pass a SCALAR s and the n x s Gaussian
-%            probes are sampled internally; OR pass an explicit n x s matrix.
+%            probes are sampled internally (seed = SketchSeed + 1000); OR pass
+%            an explicit n x s matrix (escape hatch for validation, e.g.
+%            feeding every estimator in a comparison the SAME probes).
 %            Skipped when k == n (then arg3 may be a 0/[] placeholder).
-%
-%   The seed-driven form (sizes + SketchSeed) is the normal usage and matches
-%   the RandLAPACK / BQRRP-binding convention. The explicit-matrix form is an
-%   escape hatch for validation/reproducibility (e.g. matching a reference run
-%   that fixed Omega1/Omega2), and lets a comparison study feed every estimator
-%   the SAME randomness.
 %
 %   Optional Name-Value pairs:
 %     'Func'        char in {'sqrt', 'log', 'poly', 'effdim', 'square', 'identity'}
@@ -38,24 +38,24 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, Omega1, Omega2, varargin)
 %                   to Lanczos quadrature on each quadratic form).
 %     'Depth'       Lanczos depth for 'scalar' / 'block' LFAType
 %                   (default 200 for scalar, 20 for block; ignored for 'exact')
-%     'Sketch'      {'gaussian', 'saso'} Phase-1 sketch type (default 'gaussian').
-%                   'gaussian' uses the dense Omega1 you pass in. 'saso' draws a
-%                   sparse sketching operator (RandBLAS SparseSkOp; the
-%                   SparseStack-family sketch of the paper's Algorithm 1) inside
-%                   the MEX — Omega1 is then read ONLY for its size n x k. Works
-%                   at any Q >= 1 (Q = 1 densifies the sketch internally).
+%     'Sketch'      DEPRECATED/IGNORED (default 'saso'). The Phase-1 sketch is
+%                   always the kernel-internal SASO; anything other than 'saso'
+%                   triggers a warning from the MEX. Kept so existing call
+%                   sites keep running.
 %     'VecNnz'      nonzeros per column of the SASO sketch (default 8)
-%     'SketchSeed'  RNG seed for the SASO sketch (default 42)
+%     'SketchSeed'  RNG seed for the Phase-1 sketch (default 42)
 %
 %   Returns:
 %     est   trace estimate t1 + t2
 %     t1    Phase 1 contribution sum f(lambda_hat_i)
 %     t2    Phase 2 Hutchinson correction (0 when k == n)
 %
-%   Algorithm: Persson-Kressner two-phase funNystrom++ (rank-k Nystrom
-%   approximation + Hutchinson correction on the residual). MEX wrapper over
-%   RandLAPACK::FunNystromPP<T>, T matching the class of A. Bit-identical to
-%   the reference MATLAB implementation (Persson) for LFAType='exact'.
+%   Algorithm: two-phase funNystrom++ (rank-k shifted Nystrom approximation
+%   per arXiv:2508.21189 Alg. 2 + Hutchinson correction on the residual).
+%   MEX wrapper over RandLAPACK::FunNystromPP<T>, T matching the class of A.
+%   NB the Phase-1 sketch is drawn by RandBLAS inside the kernel, so runs are
+%   reproducible at fixed SketchSeed but are NOT sketch-for-sketch identical
+%   to the Persson MATLAB reference (which draws its own Gaussian sketch).
 
     % --- Required-argument validation (friendly MATLAB-side errors) ---
     validateattributes(A, {'single', 'double'}, {'2d', 'square', 'real', 'finite'}, ...
@@ -63,23 +63,17 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, Omega1, Omega2, varargin)
     cls = class(A);
     n   = size(A, 1);
 
-    % Args 2 and 3 are seed-driven: a SCALAR (the sketch size) samples the
-    % sketch internally in the MEX; an explicit n x <cols> MATRIX is used as the
-    % sketch (escape hatch for validation/reproducibility). a1/a2 are what we
-    % forward to the MEX (scalar size as double, or matrix cast to class(A)).
-    if isscalar(Omega1)
-        validateattributes(Omega1, {'numeric'}, {'integer', 'positive', '<=', n}, ...
-                           mfilename, 'k', 2);
-        k = double(Omega1);  a1 = double(Omega1);
-    else
-        validateattributes(Omega1, {'single', 'double'}, {'2d', 'real', 'finite'}, ...
-                           mfilename, 'Omega1', 2);
-        if size(Omega1, 1) ~= n
-            error('randlapack:fun_nystrom_pp:Omega1Shape', ...
-                  'Omega1 must have n = %d rows to match A; got %d.', n, size(Omega1, 1));
-        end
-        k = size(Omega1, 2);  a1 = cast(Omega1, cls);
+    if ~isscalar(k)
+        error('randlapack:fun_nystrom_pp:Omega1Explicit', ...
+              ['arg 2 must be a scalar rank k. Explicit Omega1 matrices are no ' ...
+               'longer supported: the Phase-1 sketch is a SparseStack/SASO ' ...
+               'generated inside RandLAPACK (control it via ''SketchSeed'' and ' ...
+               '''VecNnz'').']);
     end
+    validateattributes(k, {'numeric'}, {'integer', 'positive', '<=', n}, ...
+                       mfilename, 'k', 2);
+    k  = double(k);
+    a1 = k;
 
     if k == n
         a2 = double(0);                 % Phase 2 skipped; MEX leaves arg 3 unread
@@ -108,7 +102,7 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, Omega1, Omega2, varargin)
     addParameter(p, 'PolyLambda', 10,         @(x) isnumeric(x) && isscalar(x));
     addParameter(p, 'LFAType',    'block',    @(x) ischar(x) || isstring(x));
     addParameter(p, 'Depth',      [],         @(x) isempty(x) || (isnumeric(x) && isscalar(x) && x >= 1));
-    addParameter(p, 'Sketch',     'gaussian', @(x) ischar(x) || isstring(x));
+    addParameter(p, 'Sketch',     'saso',     @(x) ischar(x) || isstring(x));
     addParameter(p, 'VecNnz',     8,          @(x) isnumeric(x) && isscalar(x) && x >= 1);
     addParameter(p, 'SketchSeed', 42,         @(x) isnumeric(x) && isscalar(x) && x >= 0);
     addParameter(p, 'Reorth',     1,          @(x) isnumeric(x) && isscalar(x));
@@ -127,12 +121,8 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, Omega1, Omega2, varargin)
     else
         d = double(p.Results.Depth);
     end
-    % Sketch='saso' works at any Q >= 1: for Q == 1 (single-pass Nystrom) the
-    % MEX densifies the sampled sparse sketch internally; for Q >= 2 it routes
-    % the first matvec through the sparse SkOp path.
 
-    % A is templated on by the MEX; keep it in the working precision. (a1/a2 were
-    % already set above: scalar size as double, or explicit sketch cast to cls.)
+    % A is templated on by the MEX; keep it in the working precision.
     A = cast(A, cls);
 
     if nargout <= 1
