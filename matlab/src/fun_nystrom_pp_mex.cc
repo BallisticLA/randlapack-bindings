@@ -124,17 +124,20 @@ private:
         return v[0];
     }
 
-    // Copy a TypedArray<T> column-major into a contiguous std::vector<T>.
-    // MATLAB arrays are column-major and contiguous, so we bulk-copy the whole
-    // buffer in one shot. The previous per-element iterator loop was a measured
-    // marshal bottleneck at large n (the n^2 element-by-element copy dominated
-    // input handling); &*begin() is the contiguous storage of a full array, so
-    // a single memcpy replaces the O(n_elems) iterator loop.
+    // Copy a TypedArray<T> column-major into a fresh heap buffer (raw new[];
+    // caller frees with delete[], RandLAPACK style). MATLAB arrays are
+    // column-major and contiguous, so we bulk-copy the whole buffer in one
+    // shot; &*begin() is the contiguous storage of a full array, so a single
+    // memcpy replaces a per-element loop (a measured marshal bottleneck at
+    // large n). `new T[]` without () default-initializes — no wasted zeroing
+    // pass before the memcpy overwrites every entry (std::vector::resize
+    // value-initializes, i.e. touches the n^2 buffer twice).
     template <typename T>
-    void copy_into(const Array& in, std::vector<T>& out, size_t n_elems) {
-        out.resize(n_elems);
+    T* copy_into(const Array& in, size_t n_elems) {
+        T* out = new T[n_elems];
         TypedArray<T> typed = in;
-        std::memcpy(out.data(), &*typed.begin(), n_elems * sizeof(T));
+        std::memcpy(out, &*typed.begin(), n_elems * sizeof(T));
+        return out;
     }
 
     // Templated worker: reads the T-typed matrices, builds the f(A)*X oracle,
@@ -151,8 +154,7 @@ private:
         // A: n x n
         const Array& A_in = inputs[0];
         const int64_t n = static_cast<int64_t>(A_in.getDimensions()[0]);
-        std::vector<T> A_buf;
-        copy_into<T>(A_in, A_buf, static_cast<size_t>(n) * n);
+        T* A_buf = copy_into<T>(A_in, static_cast<size_t>(n) * n);
 
         // scalar params (read before sketch handling: internal sampling needs them)
         const std::string func        = read_string(inputs[3], "func");
@@ -185,17 +187,18 @@ private:
         const Array& O2_in = inputs[2];
         const bool phase2_skipped = (k == n);
         int64_t s = 0;
-        std::vector<T> O2_buf;
+        T* O2_buf = nullptr;
         if (!phase2_skipped) {
             if (O2_in.getNumberOfElements() == 1) {
                 s = read_int(O2_in, "s");
-                O2_buf.assign(static_cast<size_t>(n) * s, (T)0);
+                // No zero-init: fill_dense writes every entry.
+                O2_buf = new T[static_cast<size_t>(n) * s];
                 RandBLAS::RNGState<RNG> st2(static_cast<uint32_t>(sketch_seed) + 1000u);
                 RandBLAS::DenseDist D2(n, s);
-                st2 = RandBLAS::fill_dense(D2, O2_buf.data(), st2);
+                st2 = RandBLAS::fill_dense(D2, O2_buf, st2);
             } else {
                 s = static_cast<int64_t>(O2_in.getDimensions()[1]);
-                copy_into<T>(O2_in, O2_buf, static_cast<size_t>(n) * s);
+                O2_buf = copy_into<T>(O2_in, static_cast<size_t>(n) * s);
             }
         }
 
@@ -223,7 +226,7 @@ private:
         }
 
         // --- f(A)*X oracle ---
-        linops::ExplicitSymLinOp<T> A_op(n, blas::Uplo::Upper, A_buf.data(), n, Layout::ColMajor);
+        linops::ExplicitSymLinOp<T> A_op(n, blas::Uplo::Upper, A_buf, n, Layout::ColMajor);
 
         using FAFun = std::function<void(int64_t, int64_t, const T*, T*)>;
         FAFun fAfun;
@@ -233,7 +236,7 @@ private:
         if (lfa_type == "exact") {
             // V*diag(f(lambda))*V^T*B via a one-shot syevd. Shared implementation
             // with the RandLAPACK test + benchmark (single point of correctness).
-            fAfun = testing::make_exact_fa_oracle<T>(n, A_buf.data(), fscalar);
+            fAfun = testing::make_exact_fa_oracle<T>(n, A_buf, fscalar);
         } else if (lfa_type == "scalar") {
             fAfun = [&scalar_lfa, &A_op, &fscalar, d]
                     (int64_t m_, int64_t s_, const T *B, T *Y) {
@@ -260,7 +263,7 @@ private:
         block_lfa.reorth  = reorth_flag;
         driver.vec_nnz = vec_nnz;
         T t1 = (T)0, t2 = (T)0;
-        const T *Omega2_ptr = phase2_skipped ? nullptr : O2_buf.data();
+        const T *Omega2_ptr = phase2_skipped ? nullptr : O2_buf;
         RandBLAS::RNGState<RNG> state(static_cast<uint32_t>(sketch_seed));
         T est = driver.call(A_op, fAfun, fscalar,
                             k, s, q,
@@ -297,6 +300,9 @@ private:
                                          lfa_us.data(), lfa_us.data() + lfa_us.size());
             outputs[3] = std::move(ts);
         }
+
+        delete[] A_buf;
+        delete[] O2_buf;
     }
 
 public:
