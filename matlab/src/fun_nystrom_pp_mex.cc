@@ -23,11 +23,13 @@
 //                 effdim: f(x) = x/(x + poly_lambda)   ("effective dimension"; operator monotone)
 //   q           subspace-iter count (>= 1). q = 1 is single-pass Nystrom.
 //   poly_lambda lambda used by func 'poly' and 'effdim'
-//   lfa_type    'exact' | 'scalar' | 'block'
+//   lfa_type    'exact' | 'scalar' | 'block' | 'block_qfa'
 //                 exact:  build f(A) once via syevd, every f(A)*X is a GEMM (validation oracle)
 //                 scalar: per-column scalar Lanczos-FA at depth d (= Lanczos quadrature per probe)
 //                 block:  block Lanczos-FA at depth d (BLAS-3 accelerated variant)
-//   d           Lanczos depth (only used for lfa_type in {scalar, block})
+//                 block_qfa: block Lanczos-QFA — forms Ω₂ᵀf(A)Ω₂ (s×s) directly,
+//                            skipping the f(A)·Ω₂ mapback (driver.use_qfa = true)
+//   d           Lanczos depth (only used for lfa_type in {scalar, block, block_qfa})
 //   sketch_type IGNORED (accepted for call-site compatibility; the Phase-1
 //               sketch is always the kernel-internal SASO). A MATLAB warning is
 //               issued if anything other than 'saso' is passed explicitly.
@@ -182,8 +184,10 @@ private:
         // matrices were rejected by the validation block in operator(). ---
         const int64_t k = read_int(inputs[1], "k");
 
-        // --- Phase-2 Hutchinson probes (input 3): scalar s -> sample n x s
-        // Gaussian internally; matrix -> explicit Omega2. Skipped if k == n. ---
+        // --- Phase-2 Hutchinson probes (input 3): scalar s -> generated INSIDE
+        // the kernel (FunNystromPP draws a Gaussian n x s block from `state` and
+        // normalizes each column to ‖·‖₂ = √n; O2_buf stays nullptr). A matrix
+        // arg overrides with an explicit Omega2. Skipped if k == n. ---
         const Array& O2_in = inputs[2];
         const bool phase2_skipped = (k == n);
         int64_t s = 0;
@@ -191,11 +195,8 @@ private:
         if (!phase2_skipped) {
             if (O2_in.getNumberOfElements() == 1) {
                 s = read_int(O2_in, "s");
-                // No zero-init: fill_dense writes every entry.
-                O2_buf = new T[static_cast<size_t>(n) * s];
-                RandBLAS::RNGState<RNG> st2(static_cast<uint32_t>(sketch_seed) + 1000u);
-                RandBLAS::DenseDist D2(n, s);
-                st2 = RandBLAS::fill_dense(D2, O2_buf, st2);
+                // O2_buf = nullptr -> the driver generates the normalized
+                // Gaussian probes internally (point 3 of the 2026-07-09 plan).
             } else {
                 s = static_cast<int64_t>(O2_in.getDimensions()[1]);
                 O2_buf = copy_into<T>(O2_in, static_cast<size_t>(n) * s);
@@ -230,8 +231,12 @@ private:
 
         using FAFun = std::function<void(int64_t, int64_t, const T*, T*)>;
         FAFun fAfun;
-        RandLAPACK::LanczosFA<T>      scalar_lfa;
-        RandLAPACK::BlockLanczosFA<T> block_lfa;
+        RandLAPACK::LanczosFA<T>       scalar_lfa;
+        RandLAPACK::BlockLanczosFA<T>  block_lfa;
+        RandLAPACK::BlockLanczosQFA<T> block_qfa;
+        // Lanczos-QFA fills the s×s quadratic form Ω₂ᵀf(A)Ω₂ directly (no f(A)·Ω₂
+        // mapback); the driver takes its trace. Signalled to the driver below.
+        const bool qfa_mode = (lfa_type == "block_qfa");
 
         if (lfa_type == "exact") {
             // V*diag(f(lambda))*V^T*B via a one-shot syevd. Shared implementation
@@ -247,9 +252,15 @@ private:
                     (int64_t m_, int64_t s_, const T *B, T *Y) {
                 block_lfa.call(A_op, B, m_, s_, fscalar, d, Y);
             };
+        } else if (lfa_type == "block_qfa") {
+            // Y is the s×s matrix M = Ω₂ᵀ f(A) Ω₂ (driver sizes fAOmega to s²).
+            fAfun = [&block_qfa, &A_op, &fscalar, d]
+                    (int64_t m_, int64_t s_, const T *B, T *Y) {
+                block_qfa.call(A_op, B, m_, s_, fscalar, d, Y);
+            };
         } else {
             raise("randlapack:fun_nystrom_pp_mex:lfa_type",
-                  "unknown lfa_type '" + lfa_type + "' (use exact|scalar|block)");
+                  "unknown lfa_type '" + lfa_type + "' (use exact|scalar|block|block_qfa)");
         }
 
         // --- drive funNystrom++ ---
@@ -259,9 +270,12 @@ private:
         driver.nystrom_ws.times_enabled = true;
         scalar_lfa.timing = true;
         block_lfa.timing  = true;
+        block_qfa.timing  = true;
         scalar_lfa.reorth = reorth_flag;
         block_lfa.reorth  = reorth_flag;
-        driver.vec_nnz = vec_nnz;
+        block_qfa.reorth  = reorth_flag;
+        driver.vec_nnz    = vec_nnz;
+        driver.use_qfa    = qfa_mode;
         T t1 = (T)0, t2 = (T)0;
         const T *Omega2_ptr = phase2_skipped ? nullptr : O2_buf;
         RandBLAS::RNGState<RNG> state(static_cast<uint32_t>(sketch_seed));

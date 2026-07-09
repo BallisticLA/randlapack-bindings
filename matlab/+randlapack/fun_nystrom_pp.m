@@ -30,8 +30,10 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %                   dimension" function; operator monotone).
 %     'Q'           subspace-iter count (default 2)
 %     'PolyLambda'  lambda used by Func 'poly' and 'effdim' (default 10)
-%     'LFAType'     {'exact', 'scalar', 'block'} oracle for f(A)*X
+%     'LFAType'     {'exact', 'scalar', 'block', 'block_qfa'} oracle for f(A)*X
 %                   (default 'block' — the matrix-free Krylov oracle).
+%                   'block_qfa' = block Lanczos-QFA: forms the s×s quadratic
+%                   form Ω₂ᵀf(A)Ω₂ directly (no f(A)·Ω₂ mapback); cheapest.
 %                   'exact' builds a full eigendecomposition of A (O(n^3)) and
 %                   is intended for validation/reference use, not production.
 %                   'scalar' runs one Lanczos recurrence per probe (equivalent
@@ -117,7 +119,7 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     sk_seed  = double(p.Results.SketchSeed);
     reorth   = double(p.Results.Reorth);
     if isempty(p.Results.Depth)
-        if strcmp(lfa_type, 'block'), d = 20; else, d = 200; end
+        if any(strcmp(lfa_type, {'block', 'block_qfa'})), d = 20; else, d = 200; end
     else
         d = double(p.Results.Depth);
     end
