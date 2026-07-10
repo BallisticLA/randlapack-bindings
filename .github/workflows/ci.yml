@@ -47,8 +47,11 @@ jobs:
           command: "addpath('matlab'); addpath('matlab/tests'); test_bqrrp; test_fun_nystrom_pp; disp('matlab binding tests passed');"
         env:
           # the MEX dynamically links blaspp/lapackpp; set BOTH search-path vars
-          # (Linux uses LD_LIBRARY_PATH, macOS uses DYLD_LIBRARY_PATH).
-          LD_LIBRARY_PATH:   "${{ github.workspace }}/../blaspp-install/lib:${{ github.workspace }}/../lapackpp-install/lib"
+          # (Linux uses LD_LIBRARY_PATH, macOS uses DYLD_LIBRARY_PATH). On Linux the
+          # MEX also DT_NEEDEDs the ILP64 MKL, so MKL_LIB (exported by the stack
+          # action) is prepended; it is empty on macOS, collapsing to a leading ':'
+          # that the loader ignores.
+          LD_LIBRARY_PATH:   "${{ env.MKL_LIB }}:${{ github.workspace }}/../blaspp-install/lib:${{ github.workspace }}/../lapackpp-install/lib"
           DYLD_LIBRARY_PATH: "${{ github.workspace }}/../blaspp-install/lib:${{ github.workspace }}/../lapackpp-install/lib"
 
   python:

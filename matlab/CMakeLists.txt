@@ -13,7 +13,16 @@ file(MAKE_DIRECTORY ${MEX_OUTPUT_DIR})
 # the runtime dependency entirely — the MEX file ships its own libstdc++
 # symbols and is loadable in any MATLAB without LD_PRELOAD gymnastics.
 # Applied via target_link_options on each matlab_add_mex target below.
-set(MEX_STATIC_LIBSTDCXX_FLAGS -static-libstdc++ -static-libgcc)
+#
+# These are GCC/Linux-only flags. AppleClang on macOS rejects -static-libgcc
+# ("unsupported option"): there is no libgcc to statically link (macOS uses
+# libc++, not libstdc++), and the GLIBCXX-version problem above does not exist
+# there. Leave the list empty off GNU so macOS/other compilers link normally.
+if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set(MEX_STATIC_LIBSTDCXX_FLAGS -static-libstdc++ -static-libgcc)
+else()
+    set(MEX_STATIC_LIBSTDCXX_FLAGS "")
+endif()
 
 matlab_add_mex(
     NAME bqrrp_mex
