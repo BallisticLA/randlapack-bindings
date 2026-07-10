@@ -50,9 +50,12 @@
 //                 nystrom_us     1x11 NystromEVD breakdown (microseconds):
 //                                [alloc syrf matvec gram potrf trsm svd post_svd
 //                                 err_est rest total]
-//                 lfa_us         1x5 scalar-LanczosFA breakdown (microseconds):
-//                                [matvec run_lanczos apply_f rest total]
-//                                (zeros for lfa_type 'exact'/'block')
+//                 lfa_us         1x5 Lanczos-oracle breakdown (microseconds):
+//                                [matvec run_lanczos apply rest total]
+//                                for lfa_type 'scalar'/'block'/'block_qfa'
+//                                (for 'block_qfa', apply = all compute_M work,
+//                                incl. adaptive certificate checks; zeros for
+//                                'exact')
 //                 d_used         Lanczos depth the oracle actually used. For
 //                                'block_qfa' + adaptive this is the online-chosen
 //                                depth (<= d cap); otherwise it equals the fixed
@@ -307,10 +310,15 @@ private:
             std::vector<double> nys_us(driver.nystrom_ws.times.begin(),
                                        driver.nystrom_ws.times.end());
             if (nys_us.size() != 11) nys_us.assign(11, 0.0);
-            // Scalar-LFA 5-slot breakdown; zeros for exact/block oracles.
+            // Lanczos-oracle 5-slot breakdown (whichever oracle ran); zeros for
+            // the exact oracle, which has no Lanczos phase to instrument.
             std::vector<double> lfa_us(5, 0.0);
             if (lfa_type == "scalar" && scalar_lfa.times.size() == 5) {
                 lfa_us.assign(scalar_lfa.times.begin(), scalar_lfa.times.end());
+            } else if (lfa_type == "block" && block_lfa.times.size() == 5) {
+                lfa_us.assign(block_lfa.times.begin(), block_lfa.times.end());
+            } else if (lfa_type == "block_qfa" && block_qfa.times.size() == 5) {
+                lfa_us.assign(block_qfa.times.begin(), block_qfa.times.end());
             }
             // Lanczos depth actually used by the f(A) oracle. For block_qfa with
             // adaptive stopping this is the online-chosen depth (< the d cap);
