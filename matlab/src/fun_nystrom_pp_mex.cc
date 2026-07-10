@@ -169,6 +169,12 @@ private:
         const int64_t     sketch_seed = (inputs.size() >= 11) ? read_int(inputs[10], "sketch_seed") : 42;
         // Optional input 12: Lanczos reorthogonalization flag (default 1 = full).
         const int64_t     reorth_flag = (inputs.size() >= 12) ? read_int(inputs[11], "reorth") : 1;
+        // Adaptive Lanczos-QFA depth (block_qfa only): choose the Lanczos depth
+        // online from the qfa certificate instead of the fixed d (which becomes
+        // the cap). adaptive_tol is the relative-change tolerance on tr(M_k).
+        const int64_t     adaptive_fl = (inputs.size() >= 13) ? read_int(inputs[12], "adaptive") : 0;
+        const T           adaptive_tl = (inputs.size() >= 14)
+                                        ? static_cast<T>(read_double(inputs[13], "adaptive_tol")) : (T)1e-2;
 
         if (inputs.size() >= 9 && sketch_type != "saso") {
             matlabPtr->feval(u"warning", 0, std::vector<Array>{
@@ -274,6 +280,8 @@ private:
         scalar_lfa.reorth = reorth_flag;
         block_lfa.reorth  = reorth_flag;
         block_qfa.reorth  = reorth_flag;
+        block_qfa.adaptive      = (adaptive_fl != 0);
+        block_qfa.adaptive_rtol = adaptive_tl;
         driver.vec_nnz    = vec_nnz;
         driver.use_qfa    = qfa_mode;
         T t1 = (T)0, t2 = (T)0;
@@ -324,10 +332,11 @@ public:
 
     void operator()(ArgumentList outputs, ArgumentList inputs) {
         try {
-            if (inputs.size() < 8 || inputs.size() > 12) {
+            if (inputs.size() < 8 || inputs.size() > 14) {
                 raise("randlapack:fun_nystrom_pp_mex:nargin",
-                      "Expected 8 to 12 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
-                      "lfa_type, d [, sketch_type, vec_nnz, sketch_seed, reorth]");
+                      "Expected 8 to 14 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
+                      "lfa_type, d [, sketch_type, vec_nnz, sketch_seed, reorth, "
+                      "adaptive, adaptive_tol]");
             }
             if (outputs.size() < 1 || outputs.size() > 4) {
                 raise("randlapack:fun_nystrom_pp_mex:nargout",

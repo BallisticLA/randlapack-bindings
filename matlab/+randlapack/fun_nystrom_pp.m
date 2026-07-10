@@ -108,6 +108,8 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     addParameter(p, 'VecNnz',     8,          @(x) isnumeric(x) && isscalar(x) && x >= 1);
     addParameter(p, 'SketchSeed', 42,         @(x) isnumeric(x) && isscalar(x) && x >= 0);
     addParameter(p, 'Reorth',     1,          @(x) isnumeric(x) && isscalar(x));
+    addParameter(p, 'Adaptive',   0,          @(x) isnumeric(x) && isscalar(x));
+    addParameter(p, 'AdaptiveTol',1e-2,       @(x) isnumeric(x) && isscalar(x) && x > 0);
     parse(p, varargin{:});
 
     func     = char(p.Results.Func);
@@ -118,6 +120,8 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     vec_nnz  = double(p.Results.VecNnz);
     sk_seed  = double(p.Results.SketchSeed);
     reorth   = double(p.Results.Reorth);
+    adaptive = double(p.Results.Adaptive);        % block_qfa only; Depth is the cap
+    adapt_tol = double(p.Results.AdaptiveTol);
     if isempty(p.Results.Depth)
         if any(strcmp(lfa_type, {'block', 'block_qfa'})), d = 20; else, d = 200; end
     else
@@ -129,15 +133,15 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 
     if nargout <= 1
         est = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                 sketch, vec_nnz, sk_seed, reorth);
+                                 sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol);
     elseif nargout == 2
         [est, t1] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                       sketch, vec_nnz, sk_seed, reorth);
+                                       sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol);
     elseif nargout == 3
         [est, t1, t2] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                           sketch, vec_nnz, sk_seed, reorth);
+                                           sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol);
     else
         [est, t1, t2, times] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                                  sketch, vec_nnz, sk_seed, reorth);
+                                                  sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol);
     end
 end
