@@ -53,6 +53,11 @@
 //                 lfa_us         1x5 scalar-LanczosFA breakdown (microseconds):
 //                                [matvec run_lanczos apply_f rest total]
 //                                (zeros for lfa_type 'exact'/'block')
+//                 d_used         Lanczos depth the oracle actually used. For
+//                                'block_qfa' + adaptive this is the online-chosen
+//                                depth (<= d cap); otherwise it equals the fixed
+//                                d. Matvecs of A are proportional to it, so the
+//                                benchmark uses it to cost the adaptive variant.
 //
 // A may be single or double; the computation runs in that precision and the
 // scalar outputs are returned as double. Omega1/Omega2 must match the class
@@ -307,9 +312,17 @@ private:
             if (lfa_type == "scalar" && scalar_lfa.times.size() == 5) {
                 lfa_us.assign(scalar_lfa.times.begin(), scalar_lfa.times.end());
             }
+            // Lanczos depth actually used by the f(A) oracle. For block_qfa with
+            // adaptive stopping this is the online-chosen depth (< the d cap);
+            // for every other lfa_type it is just the fixed d. Exposed so the
+            // benchmark can count matvecs for the adaptive variant (matvecs of A
+            // are proportional to this depth).
+            const double d_used = (lfa_type == "block_qfa")
+                                  ? static_cast<double>(block_qfa.d_used)
+                                  : static_cast<double>(d);
             matlab::data::StructArray ts = factory.createStructArray({1, 1},
                 {"marshal_in_ms", "phase1_ms", "phase2_ms", "fafun_ms",
-                 "assembly_ms", "specrec_ms", "nystrom_us", "lfa_us"});
+                 "assembly_ms", "specrec_ms", "nystrom_us", "lfa_us", "d_used"});
             ts[0]["marshal_in_ms"] = factory.createScalar<double>(marshal_in_ms);
             ts[0]["phase1_ms"]     = factory.createScalar<double>(driver.t_phase1_ms);
             ts[0]["phase2_ms"]     = factory.createScalar<double>(driver.t_phase2_ms);
@@ -320,6 +333,7 @@ private:
                                          nys_us.data(), nys_us.data() + nys_us.size());
             ts[0]["lfa_us"]        = factory.createArray<double>({1, lfa_us.size()},
                                          lfa_us.data(), lfa_us.data() + lfa_us.size());
+            ts[0]["d_used"]        = factory.createScalar<double>(d_used);
             outputs[3] = std::move(ts);
         }
 
