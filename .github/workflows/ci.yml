@@ -47,12 +47,13 @@ jobs:
           command: "addpath('matlab'); addpath('matlab/tests'); test_bqrrp; test_fun_nystrom_pp; disp('matlab binding tests passed');"
         env:
           # the MEX dynamically links blaspp/lapackpp; set BOTH search-path vars
-          # (Linux uses LD_LIBRARY_PATH, macOS uses DYLD_LIBRARY_PATH). On Linux the
-          # MEX also DT_NEEDEDs the ILP64 MKL, so MKL_LIB (exported by the stack
-          # action) is prepended; it is empty on macOS, collapsing to a leading ':'
-          # that the loader ignores.
+          # (Linux uses LD_LIBRARY_PATH, macOS uses DYLD_LIBRARY_PATH). The MEX also
+          # needs its vendor BLAS: Linux DT_NEEDEDs the ILP64 MKL (MKL_LIB), macOS
+          # loads OpenBLAS (OPENBLAS_LIB); both are exported by the stack action and
+          # prepended. The unused one is empty, collapsing to a leading ':' the
+          # loader ignores.
           LD_LIBRARY_PATH:   "${{ env.MKL_LIB }}:${{ github.workspace }}/../blaspp-install/lib:${{ github.workspace }}/../lapackpp-install/lib"
-          DYLD_LIBRARY_PATH: "${{ github.workspace }}/../blaspp-install/lib:${{ github.workspace }}/../lapackpp-install/lib"
+          DYLD_LIBRARY_PATH: "${{ env.OPENBLAS_LIB }}:${{ github.workspace }}/../blaspp-install/lib:${{ github.workspace }}/../lapackpp-install/lib"
 
   python:
     # Python bindings are a BQRRP-only skeleton for now; keep CI green while it

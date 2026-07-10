@@ -33,20 +33,37 @@ runs:
             | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
           sudo apt-get update -qq
           sudo apt-get install -qq -y intel-oneapi-mkl-devel
-          # Export the MKL env for later steps AND the calling job (build/run MEX)
-          # via $GITHUB_ENV: MKLROOT so blaspp auto-detects MKL; MKL_LIB (the lib
-          # dir) on LIBRARY_PATH so the linker resolves blaspp's bare -lmkl_* flags,
-          # and on LD_LIBRARY_PATH so the ILP64 MKL the MEX DT_NEEDEDs loads at
-          # runtime. LD_LIBRARY_PATH is kept to JUST the MKL dir to avoid polluting
-          # MATLAB's own runtime; mkl_gnu_thread uses system libgomp, no Intel iomp5.
-          export MKLROOT=/opt/intel/oneapi/mkl/latest
+          # Source Intel's own MKL env script (robust across versions and the
+          # 'latest' symlink) so MKLROOT / LIBRARY_PATH / CPATH / LD_LIBRARY_PATH are
+          # set correctly, then hand them to later steps AND the calling job (build/
+          # run MEX) via $GITHUB_ENV. blaspp's link test needs the MKL libs on
+          # LIBRARY_PATH and its headers on CPATH; the MEX needs the ILP64 MKL on
+          # LD_LIBRARY_PATH at runtime. mkl vars.sh is MKL-only (no Intel iomp5): we
+          # use mkl_gnu_thread + system libgomp, so MATLAB's runtime stays unpolluted.
+          MKL_ENV="$(ls /opt/intel/oneapi/mkl/*/env/vars.sh | sort -V | tail -1)"
+          source "$MKL_ENV"
           MKL_LIB="$(dirname "$(find "$MKLROOT" -name 'libmkl_core.so*' | head -1)")"
-          echo "MKLROOT=$MKLROOT"                                  >> "$GITHUB_ENV"
-          echo "MKL_LIB=$MKL_LIB"                                  >> "$GITHUB_ENV"
-          echo "LIBRARY_PATH=$MKL_LIB${LIBRARY_PATH:+:$LIBRARY_PATH}"       >> "$GITHUB_ENV"
-          echo "LD_LIBRARY_PATH=$MKL_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}" >> "$GITHUB_ENV"
+          {
+            echo "MKLROOT=$MKLROOT"
+            echo "MKL_LIB=$MKL_LIB"
+            echo "CPATH=$CPATH"
+            echo "LIBRARY_PATH=$LIBRARY_PATH"
+            echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+          } >> "$GITHUB_ENV"
         elif [ "$RUNNER_OS" = "macOS" ]; then
-          brew install googletest          # blaspp uses Apple Accelerate as BLAS
+          # OpenBLAS, NOT Apple Accelerate: RandLAPACK refuses to run BQRRP when
+          # blaspp is linked against Accelerate (rl guard), and MKL has no Apple
+          # Silicon build. macOS two-level namespaces keep the MEX bound to its own
+          # OpenBLAS at runtime (no MATLAB-BLAS interposition), so LP64 is fine here.
+          brew install googletest openblas
+          OB="$(brew --prefix openblas)"
+          {
+            echo "OPENBLAS_LIB=$OB/lib"
+            echo "LIBRARY_PATH=$OB/lib"
+            echo "LD_LIBRARY_PATH=$OB/lib"
+            echo "DYLD_LIBRARY_PATH=$OB/lib"
+            echo "CPATH=$OB/include"
+          } >> "$GITHUB_ENV"
         fi
 
     - name: clone RandLAPACK (+ RandBLAS submodule)
@@ -63,13 +80,18 @@ runs:
       run: |
         cd "${{ github.workspace }}/.."
         git clone https://github.com/icl-utk-edu/blaspp.git
-        # On Linux force ILP64 so blaspp calls MKL with 64-bit ints, matching
-        # MATLAB's runtime MKL (MKLROOT is set, so blaspp auto-detects MKL). On
-        # macOS blas_int is unset (Accelerate; the MEX is not MATLAB-ILP64-bound).
-        BLASPP_INT_OPT=""
-        if [ "$RUNNER_OS" = "Linux" ]; then BLASPP_INT_OPT="-Dblas_int=int64"; fi
+        # Linux: force ILP64 so blaspp calls MKL with 64-bit ints, matching MATLAB's
+        # runtime MKL (MKLROOT is set, so blaspp auto-detects MKL). macOS: force
+        # OpenBLAS (LP64) so blaspp does NOT pick Accelerate, which RandLAPACK's BQRRP
+        # guard rejects; two-level namespaces keep the MEX on its own OpenBLAS.
+        BLASPP_OPTS=""
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          BLASPP_OPTS="-Dblas_int=int64"
+        elif [ "$RUNNER_OS" = "macOS" ]; then
+          BLASPP_OPTS="-Dblas=OpenBLAS"
+        fi
         cmake -S blaspp -B blaspp-build -DCMAKE_BUILD_TYPE=Release \
-          -DCMAKE_INSTALL_PREFIX="$PWD/blaspp-install" -Dbuild_tests=OFF $BLASPP_INT_OPT
+          -DCMAKE_INSTALL_PREFIX="$PWD/blaspp-install" -Dbuild_tests=OFF $BLASPP_OPTS
         cmake --build blaspp-build -j2 --target install
 
     - name: install Random123
