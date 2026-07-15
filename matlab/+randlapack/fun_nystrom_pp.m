@@ -110,6 +110,10 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     addParameter(p, 'Reorth',     1,          @(x) isnumeric(x) && isscalar(x));
     addParameter(p, 'Adaptive',   0,          @(x) isnumeric(x) && isscalar(x));
     addParameter(p, 'AdaptiveTol',1e-2,       @(x) isnumeric(x) && isscalar(x) && x > 0);
+    % Certificate window for block_qfa adaptive (0 = MEX/library default). The
+    % first convergence test is at depth AdaptiveMin + AdaptiveDelay.
+    addParameter(p, 'AdaptiveDelay', 0,       @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    addParameter(p, 'AdaptiveMin',   0,       @(x) isnumeric(x) && isscalar(x) && x >= 0);
     parse(p, varargin{:});
 
     func     = char(p.Results.Func);
@@ -122,6 +126,8 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     reorth   = double(p.Results.Reorth);
     adaptive = double(p.Results.Adaptive);        % block_qfa only; Depth is the cap
     adapt_tol = double(p.Results.AdaptiveTol);
+    adapt_dl  = double(p.Results.AdaptiveDelay);
+    adapt_mn  = double(p.Results.AdaptiveMin);
     if isempty(p.Results.Depth)
         if any(strcmp(lfa_type, {'block', 'block_qfa'})), d = 20; else, d = 200; end
     else
@@ -133,15 +139,15 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 
     if nargout <= 1
         est = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                 sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol);
+                                 sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn);
     elseif nargout == 2
         [est, t1] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                       sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol);
+                                       sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn);
     elseif nargout == 3
         [est, t1, t2] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                           sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol);
+                                           sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn);
     else
         [est, t1, t2, times] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                                  sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol);
+                                                  sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn);
     end
 end

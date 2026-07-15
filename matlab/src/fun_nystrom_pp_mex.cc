@@ -183,6 +183,11 @@ private:
         const int64_t     adaptive_fl = (inputs.size() >= 13) ? read_int(inputs[12], "adaptive") : 0;
         const T           adaptive_tl = (inputs.size() >= 14)
                                         ? static_cast<T>(read_double(inputs[13], "adaptive_tol")) : (T)1e-2;
+        // Certificate window (block_qfa adaptive only). The first convergence
+        // test is at depth adaptive_min + adaptive_delay, so these set the floor
+        // on d_used. 0 = keep the library default (see BlockLanczosQFA).
+        const int64_t     adaptive_dl = (inputs.size() >= 15) ? read_int(inputs[14], "adaptive_delay") : 0;
+        const int64_t     adaptive_mn = (inputs.size() >= 16) ? read_int(inputs[15], "adaptive_min")   : 0;
 
         if (inputs.size() >= 9 && sketch_type != "saso") {
             matlabPtr->feval(u"warning", 0, std::vector<Array>{
@@ -290,6 +295,8 @@ private:
         block_qfa.reorth  = reorth_flag;
         block_qfa.adaptive      = (adaptive_fl != 0);
         block_qfa.adaptive_rtol = adaptive_tl;
+        if (adaptive_dl > 0) block_qfa.adaptive_delay = adaptive_dl;  // else library default
+        if (adaptive_mn > 0) block_qfa.adaptive_min   = adaptive_mn;
         driver.vec_nnz    = vec_nnz;
         driver.use_qfa    = qfa_mode;
         T t1 = (T)0, t2 = (T)0;
@@ -354,11 +361,11 @@ public:
 
     void operator()(ArgumentList outputs, ArgumentList inputs) {
         try {
-            if (inputs.size() < 8 || inputs.size() > 14) {
+            if (inputs.size() < 8 || inputs.size() > 16) {
                 raise("randlapack:fun_nystrom_pp_mex:nargin",
-                      "Expected 8 to 14 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
+                      "Expected 8 to 16 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
                       "lfa_type, d [, sketch_type, vec_nnz, sketch_seed, reorth, "
-                      "adaptive, adaptive_tol]");
+                      "adaptive, adaptive_tol, adaptive_delay, adaptive_min]");
             }
             if (outputs.size() < 1 || outputs.size() > 4) {
                 raise("randlapack:fun_nystrom_pp_mex:nargout",
