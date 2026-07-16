@@ -30,14 +30,19 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %                   dimension" function; operator monotone).
 %     'Q'           subspace-iter count (default 2)
 %     'PolyLambda'  lambda used by Func 'poly' and 'effdim' (default 10)
-%     'LFAType'     {'exact', 'scalar', 'block', 'block_qfa'} oracle for f(A)*X
-%                   (default 'block' — the matrix-free Krylov oracle).
+%     'LFAType'     {'exact', 'scalar', 'block', 'block_qfa', 'auto'} oracle for
+%                   f(A)*X (default 'block' — the matrix-free Krylov oracle).
 %                   'block_qfa' = block Lanczos-QFA: forms the s×s quadratic
 %                   form Ω₂ᵀf(A)Ω₂ directly (no f(A)·Ω₂ mapback); cheapest.
 %                   'exact' builds a full eigendecomposition of A (O(n^3)) and
 %                   is intended for validation/reference use, not production.
 %                   'scalar' runs one Lanczos recurrence per probe (equivalent
 %                   to Lanczos quadrature on each quadratic form).
+%                   'auto' = knob-free tier: pass 'Budget' (total A-matvec
+%                   budget) and 'AutoEps'; the driver picks k, s, and the
+%                   oracle depth itself (positional k/s become placeholders and
+%                   Depth/Reorth/Adaptive* are ignored). The times struct
+%                   reports the choices (auto_k, auto_s, d_used, probe_mv).
 %     'Depth'       Lanczos depth for 'scalar' / 'block' LFAType
 %                   (default 200 for scalar, 20 for block; ignored for 'exact')
 %     'Sketch'      DEPRECATED/IGNORED (default 'saso'). The Phase-1 sketch is
@@ -114,6 +119,11 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     % first convergence test is at depth AdaptiveMin + AdaptiveDelay.
     addParameter(p, 'AdaptiveDelay', 0,       @(x) isnumeric(x) && isscalar(x) && x >= 0);
     addParameter(p, 'AdaptiveMin',   0,       @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    % Knob-free tier (LFAType 'auto'): total A-matvec budget + target accuracy;
+    % the driver picks k, s, and the oracle depth (positional k/s and
+    % Depth/Reorth/Adaptive are ignored in this mode).
+    addParameter(p, 'Budget',  0,             @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    addParameter(p, 'AutoEps', 1e-3,          @(x) isnumeric(x) && isscalar(x) && x > 0 && x < 1);
     parse(p, varargin{:});
 
     func     = char(p.Results.Func);
@@ -128,6 +138,12 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     adapt_tol = double(p.Results.AdaptiveTol);
     adapt_dl  = double(p.Results.AdaptiveDelay);
     adapt_mn  = double(p.Results.AdaptiveMin);
+    budget    = double(p.Results.Budget);
+    auto_eps  = double(p.Results.AutoEps);
+    if strcmp(lfa_type, 'auto') && budget < 1
+        error('randlapack:fun_nystrom_pp:Budget', ...
+              'LFAType ''auto'' requires a positive ''Budget'' (total A-matvec budget).');
+    end
     if isempty(p.Results.Depth)
         if any(strcmp(lfa_type, {'block', 'block_qfa'})), d = 20; else, d = 200; end
     else
@@ -139,15 +155,15 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 
     if nargout <= 1
         est = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                 sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn);
+                                 sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn, budget, auto_eps);
     elseif nargout == 2
         [est, t1] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                       sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn);
+                                       sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn, budget, auto_eps);
     elseif nargout == 3
         [est, t1, t2] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                           sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn);
+                                           sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn, budget, auto_eps);
     else
         [est, t1, t2, times] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                                  sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn);
+                                                  sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn, budget, auto_eps);
     end
 end
