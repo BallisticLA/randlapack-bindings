@@ -23,16 +23,28 @@
 //                 effdim: f(x) = x/(x + poly_lambda)   ("effective dimension"; operator monotone)
 //   q           subspace-iter count (>= 1). q = 1 is single-pass Nystrom.
 //   poly_lambda lambda used by func 'poly' and 'effdim'
-//   lfa_type    'exact' | 'scalar' | 'block' | 'block_qfa' | 'auto'
+//   lfa_type    'exact' | 'scalar' | 'scalar_qfa' | 'block' | 'block_qfa' | 'auto'
 //                 exact:  build f(A) once via syevd, every f(A)*X is a GEMM (validation oracle)
 //                 scalar: per-column scalar Lanczos-FA at depth d (= Lanczos quadrature per probe)
+//                 scalar_qfa: per-column scalar Lanczos-QFA — the per-probe
+//                            quadratic forms ωⱼᵀf(A)ωⱼ directly (diagonal of
+//                            Ω₂ᵀf(A)Ω₂; basis-free, O(n·s) memory). With
+//                            adaptive = 1 each probe stops at its own depth via
+//                            the Gauss-Radau certificate and adaptive_tol is a
+//                            CERTIFIED per-probe relative error; reorth /
+//                            adaptive_delay / adaptive_min are IGNORED (the
+//                            certificate replaces the windowed rule; the
+//                            recurrence is intrinsically no-reorth).
 //                 block:  block Lanczos-FA at depth d (BLAS-3 accelerated variant)
 //                 block_qfa: block Lanczos-QFA — forms Ω₂ᵀf(A)Ω₂ (s×s) directly,
 //                            skipping the f(A)·Ω₂ mapback (driver.use_qfa = true)
 //                 auto:   knob-free tier. The driver picks k, s, and the oracle
-//                         depth from (budget, auto_eps) [inputs 17, 18]; the
-//                         positional k/s/d/reorth/adaptive inputs are IGNORED.
-//   d           Lanczos depth (only used for lfa_type in {scalar, block, block_qfa})
+//                         depth from (budget, auto_eps) [inputs 17, 18], running
+//                         the certified scalar QFA for both the depth probe and
+//                         Phase 2; the positional k/s/d/reorth/adaptive inputs
+//                         are IGNORED.
+//   d           Lanczos depth (used for lfa_type in {scalar, scalar_qfa, block,
+//               block_qfa}; the adaptive QFA modes treat it as a depth CAP)
 //   sketch_type IGNORED (accepted for call-site compatibility; the Phase-1
 //               sketch is always the kernel-internal SASO). A MATLAB warning is
 //               issued if anything other than 'saso' is passed explicitly.
@@ -55,21 +67,28 @@
 //                                 err_est rest total]
 //                 lfa_us         1x5 Lanczos-oracle breakdown (microseconds):
 //                                [matvec run_lanczos apply rest total]
-//                                for lfa_type 'scalar'/'block'/'block_qfa'
-//                                (for 'block_qfa', apply = all compute_M work,
-//                                incl. adaptive certificate checks; zeros for
-//                                'exact')
+//                                for lfa_type 'scalar'/'scalar_qfa'/'block'/
+//                                'block_qfa'/'auto' (for the QFA types, apply =
+//                                certificate checks + final quadrature evals;
+//                                zeros for 'exact')
 //                 d_used         Lanczos depth the oracle actually used. For
 //                                'block_qfa' + adaptive this is the online-chosen
-//                                depth (<= d cap); for 'auto' it is the probe-
-//                                discovered depth t; otherwise it equals the
-//                                fixed d. Matvecs of A are proportional to it,
-//                                so the benchmark uses it for cost accounting.
+//                                depth (<= d cap); for 'scalar_qfa' + adaptive it
+//                                is the MAX per-probe certified depth; for 'auto'
+//                                it is the probe-discovered depth cap t; otherwise
+//                                it equals the fixed d.
+//                 oracle_mv      total A-matvecs the Phase-2 oracle actually
+//                                spent (Σ per-probe depths) for 'scalar_qfa' and
+//                                'auto'; 0 for the other types (their count is
+//                                the analytic s*d_used). The benchmark should
+//                                prefer this over d_used-based re-costing.
 //                 auto_k         'auto' only: chosen Nystrom rank (else 0)
 //                 auto_s         'auto' only: chosen probe count (else 0)
-//                 probe_mv       'auto' only: matvecs spent by the depth probe
-//                                (else 0). probe_mv + auto_k + auto_s*d_used
-//                                = budget exactly.
+//                 probe_mv       'auto' only: matvecs the depth probe actually
+//                                spent (else 0). With the certified oracle the
+//                                budget closes as an upper bound:
+//                                probe_mv + q*auto_k + oracle_mv <= budget
+//                                (Phase 1 costs q*auto_k matvecs, q=1 here).
 //
 // A may be single or double; the computation runs in that precision and the
 // scalar outputs are returned as double. Omega1/Omega2 must match the class
@@ -151,11 +170,17 @@ private:
     // large n). `new T[]` without () default-initializes — no wasted zeroing
     // pass before the memcpy overwrites every entry (std::vector::resize
     // value-initializes, i.e. touches the n^2 buffer twice).
+    //
+    // `const TypedArray<T>` is essential: a non-const TypedArray selects the
+    // mutable begin(), which forces MATLAB's copy-on-write to UNSHARE (deep-
+    // copy) the whole n^2 array before the memcpy copies it again. The const
+    // overload reads the shared buffer in place, so the input A is copied once,
+    // not twice — this is the dominant piece of the flat marshal cost at n=3000.
     template <typename T>
     T* copy_into(const Array& in, size_t n_elems) {
         T* out = new T[n_elems];
-        TypedArray<T> typed = in;
-        std::memcpy(out, &*typed.begin(), n_elems * sizeof(T));
+        const TypedArray<T> typed = in;
+        std::memcpy(out, &*typed.cbegin(), n_elems * sizeof(T));
         return out;
     }
 
@@ -181,7 +206,7 @@ private:
         const T           poly_lambda = static_cast<T>(read_double(inputs[5], "poly_lambda"));
         const std::string lfa_type    = read_string(inputs[6], "lfa_type");
         const int64_t     d           = read_int   (inputs[7], "d");
-        const std::string sketch_type = (inputs.size() >= 9)  ? read_string(inputs[8], "sketch_type") : "gaussian";
+        const std::string sketch_type = (inputs.size() >= 9)  ? read_string(inputs[8], "sketch_type") : "saso";
         const int64_t     vec_nnz     = (inputs.size() >= 10) ? read_int(inputs[9],  "vec_nnz")     : 8;
         const int64_t     sketch_seed = (inputs.size() >= 11) ? read_int(inputs[10], "sketch_seed") : 42;
         // Optional input 12: Lanczos reorthogonalization flag (default 1 = full).
@@ -265,11 +290,13 @@ private:
         using FAFun = std::function<void(int64_t, int64_t, const T*, T*)>;
         FAFun fAfun;
         RandLAPACK::LanczosFA<T>       scalar_lfa;
+        RandLAPACK::LanczosQFA<T>      scalar_qfa;
         RandLAPACK::BlockLanczosFA<T>  block_lfa;
         RandLAPACK::BlockLanczosQFA<T> block_qfa;
-        // Lanczos-QFA fills the s×s quadratic form Ω₂ᵀf(A)Ω₂ directly (no f(A)·Ω₂
-        // mapback); the driver takes its trace. Signalled to the driver below.
-        const bool qfa_mode = (lfa_type == "block_qfa");
+        // Lanczos-QFA fills the quadratic form Ω₂ᵀf(A)Ω₂ directly (no f(A)·Ω₂
+        // mapback); the driver takes its trace, reading only the diagonal.
+        // Signalled to the driver below.
+        const bool qfa_mode = (lfa_type == "block_qfa" || lfa_type == "scalar_qfa");
 
         if (lfa_type == "exact") {
             // V*diag(f(lambda))*V^T*B via a one-shot syevd. Shared implementation
@@ -285,6 +312,18 @@ private:
                     (int64_t m_, int64_t s_, const T *B, T *Y) {
                 block_lfa.call(A_op, B, m_, s_, fscalar, d, Y);
             };
+        } else if (lfa_type == "scalar_qfa") {
+            // Per-column quadratic forms onto the DIAGONAL of the s×s Y (the
+            // only part the driver's use_qfa trace read touches; off-diagonals
+            // are left unwritten — same convention as the auto tier).
+            fAfun = [&scalar_qfa, &A_op, &fscalar, d]
+                    (int64_t m_, int64_t s_, const T *B, T *Y) {
+                T* qv = new T[s_];
+                scalar_qfa.call(A_op, B, m_, s_, fscalar, d, qv);
+                for (int64_t jj = 0; jj < s_; ++jj)
+                    Y[jj + jj * s_] = qv[jj];
+                delete[] qv;
+            };
         } else if (lfa_type == "block_qfa") {
             // Y is the s×s matrix M = Ω₂ᵀ f(A) Ω₂ (driver sizes fAOmega to s²).
             fAfun = [&block_qfa, &A_op, &fscalar, d]
@@ -299,7 +338,8 @@ private:
                       "lfa_type 'auto' requires a positive matvec budget (input 17)");
         } else {
             raise("randlapack:fun_nystrom_pp_mex:lfa_type",
-                  "unknown lfa_type '" + lfa_type + "' (use exact|scalar|block|block_qfa|auto)");
+                  "unknown lfa_type '" + lfa_type +
+                  "' (use exact|scalar|scalar_qfa|block|block_qfa|auto)");
         }
 
         // --- drive funNystrom++ ---
@@ -308,11 +348,18 @@ private:
         // negligible next to any BLAS work; consumed by the 4th output.
         driver.nystrom_ws.times_enabled = true;
         scalar_lfa.timing = true;
+        scalar_qfa.timing = true;
         block_lfa.timing  = true;
         block_qfa.timing  = true;
+        driver.auto_sqfa.timing = true;
         scalar_lfa.reorth = reorth_flag;
         block_lfa.reorth  = reorth_flag;
         block_qfa.reorth  = reorth_flag;
+        // scalar_qfa: intrinsically no-reorth (basis-free recurrence); reorth /
+        // adaptive_delay / adaptive_min do not apply — the Gauss-Radau
+        // certificate has no window. adaptive_tol is its CERTIFIED tolerance.
+        scalar_qfa.adaptive      = (adaptive_fl != 0);
+        scalar_qfa.adaptive_rtol = adaptive_tl;
         block_qfa.adaptive      = (adaptive_fl != 0);
         block_qfa.adaptive_rtol = adaptive_tl;
         if (adaptive_dl > 0) block_qfa.adaptive_delay = adaptive_dl;  // else library default
@@ -348,12 +395,14 @@ private:
             std::vector<double> lfa_us(5, 0.0);
             if (lfa_type == "scalar" && scalar_lfa.times.size() == 5) {
                 lfa_us.assign(scalar_lfa.times.begin(), scalar_lfa.times.end());
+            } else if (lfa_type == "scalar_qfa" && scalar_qfa.times.size() == 5) {
+                lfa_us.assign(scalar_qfa.times.begin(), scalar_qfa.times.end());
             } else if (lfa_type == "block" && block_lfa.times.size() == 5) {
                 lfa_us.assign(block_lfa.times.begin(), block_lfa.times.end());
             } else if (lfa_type == "block_qfa" && block_qfa.times.size() == 5) {
                 lfa_us.assign(block_qfa.times.begin(), block_qfa.times.end());
-            } else if (lfa_type == "auto" && driver.auto_qfa.times.size() == 5) {
-                lfa_us.assign(driver.auto_qfa.times.begin(), driver.auto_qfa.times.end());
+            } else if (lfa_type == "auto" && driver.auto_sqfa.times.size() == 5) {
+                lfa_us.assign(driver.auto_sqfa.times.begin(), driver.auto_sqfa.times.end());
             }
             // Lanczos depth actually used by the f(A) oracle. For block_qfa with
             // adaptive stopping this is the online-chosen depth (< the d cap);
@@ -361,12 +410,19 @@ private:
             // lfa_type it is just the fixed d. Exposed so the benchmark can count
             // matvecs (matvecs of A are proportional to this depth).
             double d_used;
-            if      (lfa_type == "block_qfa") d_used = static_cast<double>(block_qfa.d_used);
-            else if (lfa_type == "auto")      d_used = static_cast<double>(driver.auto_t);
-            else                              d_used = static_cast<double>(d);
+            if      (lfa_type == "block_qfa")  d_used = static_cast<double>(block_qfa.d_used);
+            else if (lfa_type == "scalar_qfa") d_used = static_cast<double>(scalar_qfa.d_used);
+            else if (lfa_type == "auto")       d_used = static_cast<double>(driver.auto_t);
+            else                               d_used = static_cast<double>(d);
+            // Actual Phase-2 oracle matvecs (Σ per-probe certified depths) for
+            // the scalar-QFA-backed types; 0 otherwise (analytic s*d_used).
+            double oracle_mv = 0.0;
+            if      (lfa_type == "scalar_qfa") oracle_mv = static_cast<double>(scalar_qfa.matvecs);
+            else if (lfa_type == "auto")       oracle_mv = static_cast<double>(driver.auto_oracle_matvecs);
             // Knob-free bookkeeping (zeros unless lfa_type == 'auto'): the chosen
-            // rank / probe count and the matvecs the depth probe spent. Total
-            // auto spend = probe_mv + auto_k + auto_s * d_used = budget exactly.
+            // rank / probe count and the matvecs the depth probe actually spent.
+            // With the certified oracle the budget closes as an upper bound:
+            // probe_mv + auto_k + oracle_mv <= budget.
             const bool is_auto = (lfa_type == "auto");
             const double auto_k_out  = is_auto ? static_cast<double>(driver.auto_k) : 0.0;
             const double auto_s_out  = is_auto ? static_cast<double>(driver.auto_s) : 0.0;
@@ -374,7 +430,7 @@ private:
             matlab::data::StructArray ts = factory.createStructArray({1, 1},
                 {"marshal_in_ms", "phase1_ms", "phase2_ms", "fafun_ms",
                  "assembly_ms", "specrec_ms", "nystrom_us", "lfa_us", "d_used",
-                 "auto_k", "auto_s", "probe_mv"});
+                 "oracle_mv", "auto_k", "auto_s", "probe_mv"});
             ts[0]["marshal_in_ms"] = factory.createScalar<double>(marshal_in_ms);
             ts[0]["phase1_ms"]     = factory.createScalar<double>(driver.t_phase1_ms);
             ts[0]["phase2_ms"]     = factory.createScalar<double>(driver.t_phase2_ms);
@@ -386,6 +442,7 @@ private:
             ts[0]["lfa_us"]        = factory.createArray<double>({1, lfa_us.size()},
                                          lfa_us.data(), lfa_us.data() + lfa_us.size());
             ts[0]["d_used"]        = factory.createScalar<double>(d_used);
+            ts[0]["oracle_mv"]     = factory.createScalar<double>(oracle_mv);
             ts[0]["auto_k"]        = factory.createScalar<double>(auto_k_out);
             ts[0]["auto_s"]        = factory.createScalar<double>(auto_s_out);
             ts[0]["probe_mv"]      = factory.createScalar<double>(probe_mv);

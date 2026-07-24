@@ -6,8 +6,9 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %   [est, t1, t2, times] = randlapack.fun_nystrom_pp(...)
 %       the 4th output is a wall-clock instrumentation struct (fields:
 %       marshal_in_ms, phase1_ms, phase2_ms, fafun_ms, assembly_ms,
-%       specrec_ms, nystrom_us (1x11), lfa_us (1x5)) for performance
-%       breakdowns. See fun_nystrom_pp_mex.cc for slot definitions.
+%       specrec_ms, nystrom_us (1x11), lfa_us (1x5), d_used, oracle_mv,
+%       auto_k, auto_s, probe_mv) for performance breakdowns and matvec
+%       accounting. See fun_nystrom_pp_mex.cc for slot definitions.
 %
 %   A        n x n matrix, single or double (symmetric; both triangles are
 %            used by the sparse sketch application — the MEX mirrors
@@ -30,10 +31,19 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %                   dimension" function; operator monotone).
 %     'Q'           subspace-iter count (default 2)
 %     'PolyLambda'  lambda used by Func 'poly' and 'effdim' (default 10)
-%     'LFAType'     {'exact', 'scalar', 'block', 'block_qfa', 'auto'} oracle for
-%                   f(A)*X (default 'block' — the matrix-free Krylov oracle).
+%     'LFAType'     {'exact', 'scalar', 'scalar_qfa', 'block', 'block_qfa',
+%                   'auto'} oracle for f(A)*X (default 'block' — the
+%                   matrix-free Krylov oracle).
 %                   'block_qfa' = block Lanczos-QFA: forms the s×s quadratic
 %                   form Ω₂ᵀf(A)Ω₂ directly (no f(A)·Ω₂ mapback); cheapest.
+%                   'scalar_qfa' = scalar Lanczos-QFA: the per-probe quadratic
+%                   forms directly (basis-free, O(n·s) memory). With
+%                   'Adaptive',1 each probe stops at its own depth via the
+%                   Gauss-Radau certificate and 'AdaptiveTol' is a CERTIFIED
+%                   per-probe relative error (no window/floor); Depth is the
+%                   cap. Reorth/AdaptiveDelay/AdaptiveMin are ignored. The
+%                   times struct reports d_used (max per-probe depth) and
+%                   oracle_mv (actual Σ per-probe matvecs).
 %                   'exact' builds a full eigendecomposition of A (O(n^3)) and
 %                   is intended for validation/reference use, not production.
 %                   'scalar' runs one Lanczos recurrence per probe (equivalent
@@ -41,10 +51,15 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %                   'auto' = knob-free tier: pass 'Budget' (total A-matvec
 %                   budget) and 'AutoEps'; the driver picks k, s, and the
 %                   oracle depth itself (positional k/s become placeholders and
-%                   Depth/Reorth/Adaptive* are ignored). The times struct
-%                   reports the choices (auto_k, auto_s, d_used, probe_mv).
-%     'Depth'       Lanczos depth for 'scalar' / 'block' LFAType
-%                   (default 200 for scalar, 20 for block; ignored for 'exact')
+%                   Depth/Reorth/Adaptive* are ignored), running the certified
+%                   scalar QFA for both the depth probe and Phase 2. The times
+%                   struct reports the choices (auto_k, auto_s, d_used,
+%                   probe_mv, oracle_mv); spend closes as an upper bound
+%                   probe_mv + q*auto_k + oracle_mv <= Budget (Phase 1 costs
+%                   q*auto_k matvecs; q = 1 here).
+%     'Depth'       Lanczos depth for 'scalar' / 'scalar_qfa' / 'block' LFAType
+%                   (default 200 for scalar/scalar_qfa, 20 for block; a CAP in
+%                   the adaptive QFA modes; ignored for 'exact')
 %     'Sketch'      DEPRECATED/IGNORED (default 'saso'). The Phase-1 sketch is
 %                   always the kernel-internal SASO; anything other than 'saso'
 %                   triggers a warning from the MEX. Kept so existing call
@@ -134,7 +149,7 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     vec_nnz  = double(p.Results.VecNnz);
     sk_seed  = double(p.Results.SketchSeed);
     reorth   = double(p.Results.Reorth);
-    adaptive = double(p.Results.Adaptive);        % block_qfa only; Depth is the cap
+    adaptive = double(p.Results.Adaptive);        % QFA types only; Depth is the cap
     adapt_tol = double(p.Results.AdaptiveTol);
     adapt_dl  = double(p.Results.AdaptiveDelay);
     adapt_mn  = double(p.Results.AdaptiveMin);
