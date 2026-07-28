@@ -65,7 +65,9 @@
 //                 nystrom_us     1x11 NystromEVD breakdown (microseconds):
 //                                [alloc syrf matvec gram potrf trsm svd post_svd
 //                                 err_est rest total]
-//                 lfa_us         1x5 Lanczos-oracle breakdown (microseconds):
+//                 lfa_us         1x6 Lanczos-oracle breakdown (microseconds):
+//                                slot 6 = reorthogonalization (FA only; 0 for QFA,
+//                                which has no reorth by design)
 //                                [matvec run_lanczos apply rest total]
 //                                for lfa_type 'scalar'/'scalar_qfa'/'block'/
 //                                'block_qfa'/'auto' (for the QFA types, apply =
@@ -362,8 +364,17 @@ private:
         scalar_qfa.adaptive_rtol = adaptive_tl;
         block_qfa.adaptive      = (adaptive_fl != 0);
         block_qfa.adaptive_rtol = adaptive_tl;
-        if (adaptive_dl > 0) block_qfa.adaptive_delay = adaptive_dl;  // else library default
-        if (adaptive_mn > 0) block_qfa.adaptive_min   = adaptive_mn;
+        // Assign UNCONDITIONALLY, restoring the library default by name when the
+        // caller passed 0. The former `if (x > 0)` form depended on the oracle
+        // being freshly constructed every call to supply the default; once the
+        // oracle is cached (persistent-handle path) that assumption is false and
+        // the previous call's window leaks forward, changing d_used and hence
+        // both the estimate and the matvec count. The oracle is non-copyable and
+        // non-assignable, so "reset by reconstruction" is not available.
+        block_qfa.adaptive_delay = (adaptive_dl > 0)
+            ? adaptive_dl : RandLAPACK::BlockLanczosQFA<T>::default_adaptive_delay;
+        block_qfa.adaptive_min   = (adaptive_mn > 0)
+            ? adaptive_mn : RandLAPACK::BlockLanczosQFA<T>::default_adaptive_min;
         driver.vec_nnz    = vec_nnz;
         driver.use_qfa    = qfa_mode;
         T t1 = (T)0, t2 = (T)0;
@@ -390,18 +401,18 @@ private:
             std::vector<double> nys_us(driver.nystrom_ws.times.begin(),
                                        driver.nystrom_ws.times.end());
             if (nys_us.size() != 11) nys_us.assign(11, 0.0);
-            // Lanczos-oracle 5-slot breakdown (whichever oracle ran); zeros for
+            // Lanczos-oracle 6-slot breakdown (whichever oracle ran); zeros for
             // the exact oracle, which has no Lanczos phase to instrument.
-            std::vector<double> lfa_us(5, 0.0);
-            if (lfa_type == "scalar" && scalar_lfa.times.size() == 5) {
+            std::vector<double> lfa_us(6, 0.0);
+            if (lfa_type == "scalar" && scalar_lfa.times.size() >= 5) {
                 lfa_us.assign(scalar_lfa.times.begin(), scalar_lfa.times.end());
-            } else if (lfa_type == "scalar_qfa" && scalar_qfa.times.size() == 5) {
+            } else if (lfa_type == "scalar_qfa" && scalar_qfa.times.size() >= 5) {
                 lfa_us.assign(scalar_qfa.times.begin(), scalar_qfa.times.end());
-            } else if (lfa_type == "block" && block_lfa.times.size() == 5) {
+            } else if (lfa_type == "block" && block_lfa.times.size() >= 5) {
                 lfa_us.assign(block_lfa.times.begin(), block_lfa.times.end());
-            } else if (lfa_type == "block_qfa" && block_qfa.times.size() == 5) {
+            } else if (lfa_type == "block_qfa" && block_qfa.times.size() >= 5) {
                 lfa_us.assign(block_qfa.times.begin(), block_qfa.times.end());
-            } else if (lfa_type == "auto" && driver.auto_sqfa.times.size() == 5) {
+            } else if (lfa_type == "auto" && driver.auto_sqfa.times.size() >= 5) {
                 lfa_us.assign(driver.auto_sqfa.times.begin(), driver.auto_sqfa.times.end());
             }
             // Lanczos depth actually used by the f(A) oracle. For block_qfa with
