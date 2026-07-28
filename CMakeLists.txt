@@ -34,3 +34,15 @@ else()
         "${CMAKE_CURRENT_SOURCE_DIR}/matlab to the MATLAB path, "
         "but calls into bqrrp_mex will fail until the MEX is built.")
 endif()
+
+# ---------------------------------------------------------------------------
+# Benchmark external baselines (off by default). When ON, FetchContent pulls
+# the external reference implementations (Epperly, Persson) used by the
+# funNystrom++ benchmark at configure time — NOT vendored in this repo.
+# See matlab/benchmark/funnystrompp/CMakeLists.txt and THIRD_PARTY_LICENSES.md.
+# ---------------------------------------------------------------------------
+option(RANDLAPACK_BINDINGS_BENCHMARKS
+       "Fetch external benchmark baselines (Epperly, Persson) via FetchContent" OFF)
+if(RANDLAPACK_BINDINGS_BENCHMARKS)
+    add_subdirectory(matlab/benchmark/funnystrompp)
+endif()

@@ -2,9 +2,15 @@
 
 MATLAB, and eventually Python, bindings for [RandLAPACK](https://github.com/BallisticLA/RandLAPACK).
 
-## Scope (v0)
+## Scope
 
-Proof-of-concept binding for a single driver, `BQRRP` (randomized blocked QR with column pivoting), in single and double precision, real matrices, column-major. More drivers as their C++ APIs stabilize. Python next.
+Bindings for selected RandLAPACK drivers, single and double precision, real matrices, column-major:
+
+* **`BQRRP`** (randomized blocked QR with column pivoting) — MATLAB + Python.
+* **`FunNystromPP`** (matrix-function trace estimation, `tr f(A)`) — MATLAB. The
+  Python binding is deferred.
+
+More drivers as their C++ APIs stabilize.
 
 ## Requirements
 
@@ -21,7 +27,14 @@ cmake -S . -B build \
 cmake --build build -j
 ```
 
-If MATLAB is not found, MEX targets are skipped with a clear warning; the `.m` files still ship and can be used once the MEX is built. On success, `matlab/+randlapack/private/bqrrp_mex.<ext>` is in place.
+If MATLAB is not found, MEX targets are skipped with a clear warning; the `.m` files still ship and can be used once the MEX is built. On success, the per-driver MEX (`matlab/+randlapack/private/{bqrrp,fun_nystrom_pp}_mex.<ext>`) is in place.
+
+### Prebuilt release (no compiler, no CMake)
+
+To avoid building RandLAPACK and the MEX yourself, a release archive ships the
+`.m` files plus a prebuilt `matlab/+randlapack/private/*.mexa64`. Unzip,
+`addpath('.../matlab')`, and call the functions directly. Prebuilt binaries are
+currently **Linux x86-64 only**; on macOS/Windows, build from source as above.
 
 ## Usage
 
@@ -42,15 +55,21 @@ Two output modes, chosen by a trailing string (qr-style):
 
 Run `help randlapack.bqrrp` for the full signature, including the optional `b_sz`, `d_factor`, and RNG `state` arguments.
 
-## Runtime notes
+For matrix-function trace estimation:
 
-On **Linux MATLAB R2026a + Ubuntu 24.04** (and similar new-glibc hosts), MATLAB ships an older `libstdc++.so.6` than your compiler's. MEX files built against the system `libstdc++` fail at load with `version GLIBCXX_3.4.32 not found`. Workaround:
-
-```sh
-LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 matlab
+```matlab
+A = gallery('randsvd', 1000);   % symmetric test matrix
+n = size(A, 1);
+est = randlapack.fun_nystrom_pp(A, randn(n, 100), randn(n, 50), 'Func', 'sqrt');
 ```
 
-Alias it in your shell profile to make it transparent. Not needed on macOS or older Ubuntu hosts.
+Run `help randlapack.fun_nystrom_pp` for the full name-value signature (`Func`, `Q`, `LFAType`, `Depth`, `Sketch`, `Reorth`, …).
+
+## Runtime notes
+
+The MEX targets statically link `libstdc++`/`libgcc` (`-static-libstdc++ -static-libgcc`), so they load in any MATLAB regardless of the `GLIBCXX` version MATLAB ships — **no `LD_PRELOAD` is needed**. (Earlier versions required preloading the system `libstdc++.so.6`; that is no longer the case.)
+
+The MEX does dynamically link BLAS/LAPACK (via blaspp/lapackpp). When running outside the build environment, point `LD_LIBRARY_PATH` at the blaspp/lapackpp install `lib`/`lib64` dirs, and set `MKL_INTERFACE_LAYER=ILP64`, `MKL_THREADING_LAYER=GNU` if using MKL.
 
 ## Conventions
 

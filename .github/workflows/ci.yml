@@ -1,0 +1,83 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+# Tests the BINDING layer (the glue), not RandLAPACK's numerics — RandLAPACK has
+# its own CI. We build the RandLAPACK stack (composite action, mirroring
+# RandLAPACK's core-linux/core-macos), then build + exercise the bindings.
+#
+# MATLAB: matlab-actions/setup-matlab runs license-free on PUBLIC GitHub repos
+# (this repo is public). Linux + macOS via the job matrix.
+
+jobs:
+  matlab:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build RandLAPACK stack
+        uses: ./.github/actions/build-randlapack-stack
+
+      - name: set up MATLAB
+        uses: matlab-actions/setup-matlab@v2
+
+      - name: build the MEX bindings
+        shell: bash
+        run: |
+          DEPS="$(cd "${{ github.workspace }}/.." && pwd)"
+          MATLAB_ROOT="$(dirname "$(dirname "$(command -v matlab)")")"
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRandLAPACK_DIR="$DEPS/RandLAPACK-install/lib/cmake/RandLAPACK" \
+            -Dblaspp_DIR="$DEPS/blaspp-install/lib/cmake/blaspp" \
+            -Dlapackpp_DIR="$DEPS/lapackpp-install/lib/cmake/lapackpp" \
+            -DMatlab_ROOT_DIR="$MATLAB_ROOT"
+          cmake --build build -j2
+
+      - name: run MATLAB binding tests
+        uses: matlab-actions/run-command@v2
+        with:
+          command: "addpath('matlab'); addpath('matlab/tests'); test_bqrrp; test_fun_nystrom_pp; disp('matlab binding tests passed');"
+        env:
+          # the MEX dynamically links blaspp/lapackpp; set BOTH search-path vars
+          # (Linux uses LD_LIBRARY_PATH, macOS uses DYLD_LIBRARY_PATH). The MEX also
+          # needs its vendor BLAS: Linux DT_NEEDEDs the ILP64 MKL (MKL_LIB), macOS
+          # loads OpenBLAS (OPENBLAS_LIB); both are exported by the stack action and
+          # prepended. The unused one is empty, collapsing to a leading ':' the
+          # loader ignores.
+          LD_LIBRARY_PATH:   "${{ env.MKL_LIB }}:${{ github.workspace }}/../blaspp-install/lib:${{ github.workspace }}/../lapackpp-install/lib"
+          DYLD_LIBRARY_PATH: "${{ env.OPENBLAS_LIB }}:${{ github.workspace }}/../blaspp-install/lib:${{ github.workspace }}/../lapackpp-install/lib"
+
+  python:
+    # Python bindings are a BQRRP-only skeleton for now; keep CI green while it
+    # matures (the job still reports build/test status).
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build RandLAPACK stack
+        uses: ./.github/actions/build-randlapack-stack
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: build + test the Python bindings
+        shell: bash
+        run: |
+          DEPS="$(cd "${{ github.workspace }}/.." && pwd)"
+          export RandLAPACK_DIR="$DEPS/RandLAPACK-install/lib/cmake/RandLAPACK"
+          export blaspp_DIR="$DEPS/blaspp-install/lib/cmake/blaspp"
+          export lapackpp_DIR="$DEPS/lapackpp-install/lib/cmake/lapackpp"
+          export LD_LIBRARY_PATH="$DEPS/blaspp-install/lib:$DEPS/lapackpp-install/lib:${LD_LIBRARY_PATH:-}"
+          python -m pip install --upgrade pip pytest numpy pybind11
+          python -m pip install ./python -v
+          pytest python/tests -q

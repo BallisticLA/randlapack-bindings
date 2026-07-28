@@ -1,0 +1,128 @@
+name: build-randlapack-stack
+description: >
+  Build and install the RandLAPACK stack (BLAS++, Random123, LAPACK++, RandLAPACK)
+  as siblings of the checked-out bindings workspace, so the bindings can
+  find_package(RandLAPACK). Linux + macOS. Mirrors the dependency bring-up in
+  RandLAPACK's own core-linux.yaml / core-macos.yaml.
+
+inputs:
+  randlapack-ref:
+    description: RandLAPACK git ref to build the bindings against.
+    # Bump to main once FunNystromPP lands there; for now the branch that has it.
+    default: funnystrompp-v2-baseline
+
+runs:
+  using: composite
+  steps:
+    - name: base toolchain + BLAS
+      shell: bash
+      run: |
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          export DEBIAN_FRONTEND=noninteractive
+          # Intel MKL (ILP64) is the BLAS on Linux, NOT OpenBLAS: the bindings run
+          # inside MATLAB, whose runtime BLAS is MKL ILP64 (64-bit ints). blaspp must
+          # match that ABI or MATLAB's MKL services the MEX's BLAS calls with the wrong
+          # integer width (garbage leading dimension -> "Parameter N incorrect on entry
+          # to DGEMM" -> segfault). This mirrors the working local dev setup.
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y git-core gcc g++ gfortran cmake m4 \
+            libgtest-dev wget gpg
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | sudo gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y intel-oneapi-mkl-devel
+          # Source Intel's own MKL env script (robust across versions and the
+          # 'latest' symlink) so MKLROOT / LIBRARY_PATH / CPATH / LD_LIBRARY_PATH are
+          # set correctly, then hand them to later steps AND the calling job (build/
+          # run MEX) via $GITHUB_ENV. blaspp's link test needs the MKL libs on
+          # LIBRARY_PATH and its headers on CPATH; the MEX needs the ILP64 MKL on
+          # LD_LIBRARY_PATH at runtime. mkl vars.sh is MKL-only (no Intel iomp5): we
+          # use mkl_gnu_thread + system libgomp, so MATLAB's runtime stays unpolluted.
+          MKL_ENV="$(ls /opt/intel/oneapi/mkl/*/env/vars.sh | sort -V | tail -1)"
+          source "$MKL_ENV"
+          MKL_LIB="$(dirname "$(find "$MKLROOT" -name 'libmkl_core.so*' | head -1)")"
+          {
+            echo "MKLROOT=$MKLROOT"
+            echo "MKL_LIB=$MKL_LIB"
+            echo "CPATH=$CPATH"
+            echo "LIBRARY_PATH=$LIBRARY_PATH"
+            echo "LD_LIBRARY_PATH=$LD_LIBRARY_PATH"
+          } >> "$GITHUB_ENV"
+        elif [ "$RUNNER_OS" = "macOS" ]; then
+          # OpenBLAS, NOT Apple Accelerate: RandLAPACK refuses to run BQRRP when
+          # blaspp is linked against Accelerate (rl guard), and MKL has no Apple
+          # Silicon build. macOS two-level namespaces keep the MEX bound to its own
+          # OpenBLAS at runtime (no MATLAB-BLAS interposition), so LP64 is fine here.
+          brew install googletest openblas
+          OB="$(brew --prefix openblas)"
+          {
+            echo "OPENBLAS_LIB=$OB/lib"
+            echo "LIBRARY_PATH=$OB/lib"
+            echo "LD_LIBRARY_PATH=$OB/lib"
+            echo "DYLD_LIBRARY_PATH=$OB/lib"
+            echo "CPATH=$OB/include"
+          } >> "$GITHUB_ENV"
+        fi
+
+    - name: clone RandLAPACK (+ RandBLAS submodule)
+      shell: bash
+      run: |
+        cd "${{ github.workspace }}/.."
+        git clone https://github.com/BallisticLA/RandLAPACK.git
+        cd RandLAPACK
+        git checkout "${{ inputs.randlapack-ref }}"
+        git submodule update --init --recursive
+
+    - name: build + install BLAS++
+      shell: bash
+      run: |
+        cd "${{ github.workspace }}/.."
+        git clone https://github.com/icl-utk-edu/blaspp.git
+        # Linux: force ILP64 so blaspp calls MKL with 64-bit ints, matching MATLAB's
+        # runtime MKL (MKLROOT is set, so blaspp auto-detects MKL). macOS: force
+        # OpenBLAS (LP64) so blaspp does NOT pick Accelerate, which RandLAPACK's BQRRP
+        # guard rejects; two-level namespaces keep the MEX on its own OpenBLAS.
+        BLASPP_OPTS=""
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          BLASPP_OPTS="-Dblas_int=int64"
+        elif [ "$RUNNER_OS" = "macOS" ]; then
+          BLASPP_OPTS="-Dblas=OpenBLAS"
+        fi
+        cmake -S blaspp -B blaspp-build -DCMAKE_BUILD_TYPE=Release \
+          -DCMAKE_INSTALL_PREFIX="$PWD/blaspp-install" -Dbuild_tests=OFF $BLASPP_OPTS
+        cmake --build blaspp-build -j2 --target install
+
+    - name: install Random123
+      shell: bash
+      run: |
+        cd "${{ github.workspace }}/.."
+        git clone https://github.com/DEShawResearch/Random123.git
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          make -C Random123 prefix="$PWD/Random123-install" install-include
+        else
+          mkdir -p Random123-install/include
+          cp -rp Random123/include/Random123 Random123-install/include/
+        fi
+
+    - name: build + install LAPACK++
+      shell: bash
+      run: |
+        cd "${{ github.workspace }}/.."
+        git clone https://github.com/icl-utk-edu/lapackpp.git
+        cmake -S lapackpp -B lapackpp-build -DCMAKE_BUILD_TYPE=Release \
+          -Dblaspp_DIR="$PWD/blaspp-install/lib/cmake/blaspp" \
+          -DCMAKE_INSTALL_PREFIX="$PWD/lapackpp-install" -Dbuild_tests=OFF
+        cmake --build lapackpp-build -j2 --target install
+
+    - name: build + install RandLAPACK (headers + cmake config; no tests built)
+      shell: bash
+      run: |
+        cd "${{ github.workspace }}/.."
+        cmake -S RandLAPACK -B RandLAPACK-build -DCMAKE_BUILD_TYPE=Release \
+          -Dblaspp_DIR="$PWD/blaspp-install/lib/cmake/blaspp" \
+          -Dlapackpp_DIR="$PWD/lapackpp-install/lib/cmake/lapackpp" \
+          -DRandom123_DIR="$PWD/Random123-install/include/" \
+          -DCMAKE_INSTALL_PREFIX="$PWD/RandLAPACK-install"
+        cmake --build RandLAPACK-build -j2 --target install
