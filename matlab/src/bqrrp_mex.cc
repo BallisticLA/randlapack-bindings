@@ -115,47 +115,60 @@ private:
         const int64_t k = std::min(m, n);
         const T d_factor = static_cast<T>(d_factor_in);
 
-        // BQRRP overwrites A; copy into a mutable scratch buffer (column-major,
-        // matching MATLAB's storage layout).
-        std::vector<T> A_work(static_cast<size_t>(m) * static_cast<size_t>(n));
-        TypedArray<T> A_typed = A_in;
-        {
-            size_t idx = 0;
-            for (const auto v : A_typed) {
-                A_work[idx++] = v;
-            }
-        }
+        const size_t mn = static_cast<size_t>(m) * static_cast<size_t>(n);
 
-        std::vector<T> tau(std::max<int64_t>(1, n));
-        std::vector<int64_t> J(std::max<int64_t>(1, n));
+        // Bulk-copy the input in one memcpy. The TypedArray view must be
+        // const: binding a non-const TypedArray triggers MATLAB's
+        // copy-on-write unshare, which deep-copies the m-by-n input before a
+        // single element is read (the dominant marshal cost). MATLAB stores
+        // column-major, so the copy is layout-preserving.
+        const TypedArray<T> A_typed = A_in;
+        const T* A_src = &*A_typed.cbegin();
+
+        // J is written by BQRRP directly into its output buffer.
+        auto J_buf = factory.createBuffer<int64_t>(static_cast<size_t>(std::max<int64_t>(1, n)));
 
         auto state = read_state(inputs[3]);
-
         RandLAPACK::BQRRP<T, RNG> alg(false, b_sz);
-        int ret = alg.call(m, n, A_work.data(), m, d_factor, tau.data(),
-                           J.data(), state);
-        if (ret != 0) {
-            raise("randlapack:bqrrp_mex:returnCode",
-                "BQRRP returned non-zero status " + std::to_string(ret));
-        }
 
         if (implicit) {
             // out1 = A_out (m-by-n, GEQP3-format); out2 = tau (length n).
-            auto A_buf = factory.createBuffer<T>(
-                static_cast<size_t>(m) * static_cast<size_t>(n));
-            std::memcpy(A_buf.get(), A_work.data(),
-                        sizeof(T) * static_cast<size_t>(m)
-                                  * static_cast<size_t>(n));
+            // BQRRP factors in place, so it can work directly inside the
+            // output buffers: marshal the input straight into out1's buffer
+            // and let the driver write tau into out2's. No scratch, and the
+            // input memcpy above is the only copy of A in this mode.
+            auto A_buf = factory.createBuffer<T>(mn);
+            std::memcpy(A_buf.get(), A_src, sizeof(T) * mn);
+            auto tau_buf = factory.createBuffer<T>(static_cast<size_t>(std::max<int64_t>(1, n)));
+
+            int ret = alg.call(m, n, A_buf.get(), m, d_factor, tau_buf.get(),
+                               J_buf.get(), state);
+            if (ret != 0) {
+                raise("randlapack:bqrrp_mex:returnCode",
+                    "BQRRP returned non-zero status " + std::to_string(ret));
+            }
+
             outputs[0] = factory.createArrayFromBuffer<T>(
                 {static_cast<size_t>(m), static_cast<size_t>(n)},
                 std::move(A_buf));
-
-            auto tau_buf = factory.createBuffer<T>(static_cast<size_t>(n));
-            std::memcpy(tau_buf.get(), tau.data(),
-                        sizeof(T) * static_cast<size_t>(n));
             outputs[1] = factory.createArrayFromBuffer<T>(
                 {1, static_cast<size_t>(n)}, std::move(tau_buf));
         } else {
+            // Explicit mode needs a mutable scratch copy of A: the factored
+            // form is post-processed (R extraction, then ungqr) before the
+            // Q/R outputs exist. new[] through unique_ptr avoids
+            // std::vector's value-initialization pass over m*n elements and
+            // stays exception-safe across raise().
+            std::unique_ptr<T[]> A_work(new T[mn]);
+            std::memcpy(A_work.get(), A_src, sizeof(T) * mn);
+            std::vector<T> tau(std::max<int64_t>(1, n));
+
+            int ret = alg.call(m, n, A_work.get(), m, d_factor, tau.data(),
+                               J_buf.get(), state);
+            if (ret != 0) {
+                raise("randlapack:bqrrp_mex:returnCode",
+                    "BQRRP returned non-zero status " + std::to_string(ret));
+            }
             // out1 = Q (m-by-k explicit); out2 = R (k-by-n).
             // Order matters: ungqr clobbers the upper triangle of A_work, so
             // copy R out first.
@@ -175,7 +188,7 @@ private:
                 {static_cast<size_t>(k), static_cast<size_t>(n)},
                 std::move(R_buf));
 
-            int64_t info = lapack::ungqr(m, k, k, A_work.data(), m, tau.data());
+            int64_t info = lapack::ungqr(m, k, k, A_work.get(), m, tau.data());
             if (info != 0) {
                 raise("randlapack:bqrrp_mex:ungqr",
                     "lapack::ungqr returned info=" + std::to_string(info));
@@ -183,7 +196,7 @@ private:
 
             auto Q_buf = factory.createBuffer<T>(
                 static_cast<size_t>(m) * static_cast<size_t>(k));
-            std::memcpy(Q_buf.get(), A_work.data(),
+            std::memcpy(Q_buf.get(), A_work.get(),
                         sizeof(T) * static_cast<size_t>(m)
                                   * static_cast<size_t>(k));
             outputs[0] = factory.createArrayFromBuffer<T>(
@@ -191,9 +204,7 @@ private:
                 std::move(Q_buf));
         }
 
-        // J: 1-based int64 row vector.
-        auto J_buf = factory.createBuffer<int64_t>(static_cast<size_t>(n));
-        std::memcpy(J_buf.get(), J.data(), sizeof(int64_t) * static_cast<size_t>(n));
+        // J: 1-based int64 row vector, written by BQRRP in place above.
         outputs[2] = factory.createArrayFromBuffer<int64_t>(
             {1, static_cast<size_t>(n)}, std::move(J_buf));
 
