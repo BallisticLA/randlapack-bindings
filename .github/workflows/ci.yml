@@ -1,0 +1,131 @@
+name: ci
+
+# Tests the BINDING layer (the glue), not RandLAPACK's numerics -- RandLAPACK
+# has its own CI. The stack is provided by RandLAPACK's own installer at a
+# pinned commit (see .github/actions/build-randlapack-stack), then the
+# bindings are built and exercised against it.
+#
+# MATLAB: matlab-actions/setup-matlab runs license-free on PUBLIC GitHub repos
+# (this repo is public). Linux + macOS via the job matrix.
+
+on:
+  pull_request:
+  workflow_dispatch:
+  # Only main. A branch with an open pull request is already covered by the
+  # pull_request event, and firing on both runs every job twice per commit.
+  push:
+    branches:
+      - main
+
+# One run per ref. Superseding is only safe for pull requests: on main every
+# commit should be validated, not just the newest.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  matlab:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build RandLAPACK stack
+        uses: ./.github/actions/build-randlapack-stack
+
+      - name: set up MATLAB
+        uses: matlab-actions/setup-matlab@v2
+
+      - name: build the MEX bindings
+        shell: bash
+        run: |
+          set -euo pipefail
+          MATLAB_ROOT="$(dirname "$(dirname "$(command -v matlab)")")"
+          cmake -S . -B build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DRandLAPACK_DIR="$RandLAPACK_DIR" \
+            -DMatlab_ROOT_DIR="$MATLAB_ROOT"
+          cmake --build build -j2
+
+      - name: run MATLAB binding tests
+        uses: matlab-actions/run-command@v2
+        with:
+          command: "addpath('matlab'); addpath('matlab/tests'); test_bqrrp; disp('matlab binding tests passed');"
+        env:
+          # The MEX dynamically links blaspp/lapackpp; set BOTH search-path
+          # vars (Linux uses LD_LIBRARY_PATH, macOS uses DYLD_LIBRARY_PATH).
+          # The MEX also needs its vendor BLAS: Linux DT_NEEDEDs the ILP64 MKL
+          # (MKL_LIB), macOS loads OpenBLAS (OPENBLAS_LIB); both are exported
+          # by the stack action, as are BLASPP_LIB/LAPACKPP_LIB (their install
+          # directories carry the backend in their names, so they are not
+          # spelled out here). The unused vendor var is empty, collapsing to a
+          # leading ':' the loader ignores.
+          LD_LIBRARY_PATH:   "${{ env.MKL_LIB }}:${{ env.BLASPP_LIB }}:${{ env.LAPACKPP_LIB }}"
+          DYLD_LIBRARY_PATH: "${{ env.OPENBLAS_LIB }}:${{ env.BLASPP_LIB }}:${{ env.LAPACKPP_LIB }}"
+
+  python:
+    # Python bindings are a BQRRP-only skeleton for now; keep CI green while
+    # it matures (the job still reports build/test status). Becomes required
+    # when the nanobind migration lands.
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build RandLAPACK stack
+        uses: ./.github/actions/build-randlapack-stack
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: build + test the Python bindings
+        shell: bash
+        run: |
+          set -euo pipefail
+          export LD_LIBRARY_PATH="$BLASPP_LIB:$LAPACKPP_LIB:${LD_LIBRARY_PATH:-}"
+          python -m pip install --upgrade pip pytest
+          python -m pip install ./python -v
+          pytest python/tests -q
+
+  # The user-facing entry point, exercised as documented: a bare clone, an
+  # existing RandLAPACK install, and one command. The stack action already
+  # installed RandLAPACK into ../RandNLA-project, so this exercises the
+  # discovery path (RANDNLA_PROJECT_DIR) end to end.
+  bootstrap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: build RandLAPACK stack
+        uses: ./.github/actions/build-randlapack-stack
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: run bootstrap.sh against the existing install
+        shell: bash
+        run: |
+          set -euo pipefail
+          export RANDNLA_PROJECT_DIR="$(cd "$GITHUB_WORKSPACE/.." && pwd)/RandNLA-project"
+          export LD_LIBRARY_PATH="$BLASPP_LIB:$LAPACKPP_LIB:${LD_LIBRARY_PATH:-}"
+          python -m pip install --upgrade pip pytest
+          bash bootstrap.sh --yes 2>&1 | tee bootstrap.out
+          grep -q "reused from" bootstrap.out \
+            || { echo "bootstrap did not reuse the existing RandLAPACK install"; exit 1; }
+
+      # Redirected output must carry no ANSI escapes and no carriage returns,
+      # same contract as the library installers.
+      - name: piped output is free of terminal control sequences
+        shell: bash
+        run: |
+          if LC_ALL=C grep -qP '\x1b\[|\r' bootstrap.out; then
+            echo "Found terminal control sequences in non-TTY output:"
+            LC_ALL=C grep -nP '\x1b\[|\r' bootstrap.out | head -20
+            exit 1
+          fi
+          echo "OK: no escape sequences in redirected output."
