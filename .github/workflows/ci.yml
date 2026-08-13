@@ -92,10 +92,6 @@ jobs:
           DYLD_LIBRARY_PATH: "${{ env.OPENBLAS_LIB }}:${{ env.BLASPP_LIB }}:${{ env.LAPACKPP_LIB }}"
 
   python:
-    # Python bindings are a BQRRP-only skeleton for now; keep CI green while
-    # it matures (the job still reports build/test status). Becomes required
-    # when the nanobind migration lands.
-    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

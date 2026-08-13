@@ -1,15 +1,27 @@
-cmake_minimum_required(VERSION 3.20)
+cmake_minimum_required(VERSION 3.21)
 project(randlapack_python LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
-find_package(pybind11 CONFIG REQUIRED)
+find_package(Python 3.10 COMPONENTS Interpreter Development.Module REQUIRED)
+
+# nanobind ships its CMake config inside the installed wheel; ask the build
+# Python where that is. This is the standard scikit-build-core recipe (the
+# nanobind_example template): under pip, nanobind is a build requirement from
+# pyproject.toml, so the interpreter running the build always has it.
+execute_process(
+    COMMAND "${Python_EXECUTABLE}" -m nanobind --cmake_dir
+    OUTPUT_STRIP_TRAILING_WHITESPACE
+    OUTPUT_VARIABLE nanobind_ROOT)
+find_package(nanobind CONFIG REQUIRED)
+
 find_package(RandLAPACK CONFIG REQUIRED)
 
-pybind11_add_module(_randlapack
+# NB_STATIC links nanobind's support library into the extension, so the wheel
+# has no separate libnanobind to locate at import time.
+nanobind_add_module(_randlapack NB_STATIC
     src/randlapack_module.cc
     src/bqrrp_binding.cc
 )
