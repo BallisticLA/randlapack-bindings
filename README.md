@@ -128,6 +128,20 @@ OpenBLAS (RandLAPACK's installer default on macOS) until BLAS++ adopts Apple's n
 interface — tracked in
 [RandLAPACK #165](https://github.com/BallisticLA/RandLAPACK/issues/165).
 
+**macOS, manual build: `Could NOT find OpenMP_CXX`.** BLAS++'s installed CMake config does
+`find_dependency(OpenMP)`, which stock Apple Clang cannot satisfy on its own, so every
+consumer of the stack needs the same libomp hints the installer used. `bootstrap.sh` adds
+them for you; if you drive CMake yourself, add:
+
+```sh
+LIBOMP=$(brew --prefix libomp)
+cmake -S . -B build ... \
+    -DOpenMP_CXX_LIB_NAMES=omp -DOpenMP_C_LIB_NAMES=omp \
+    -DOpenMP_omp_LIBRARY=$LIBOMP/lib/libomp.dylib \
+    "-DOpenMP_CXX_FLAGS=-Xpreprocessor;-fopenmp" \
+    "-DOpenMP_C_FLAGS=-Xpreprocessor;-fopenmp"
+```
+
 **`pip` refuses to install (`externally-managed-environment`).** Use a virtualenv; see
 Quick start.
 

@@ -238,6 +238,28 @@ else
     PROJECT_DIR="$(dirname "$SCRIPT_DIR")/RandNLA-project"
 fi
 
+# macOS: the RandLAPACK stack is built against Homebrew's libomp, so BLAS++'s
+# installed config does find_dependency(OpenMP) -- which stock Apple Clang
+# cannot satisfy unaided. Every consumer configure on macOS therefore needs
+# the same OpenMP hints RandLAPACK's installer used. Computed once here, used
+# for both the CMake configure and the pip build below.
+OPENMP_HINTS=()
+if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
+    LIBOMP="$(brew --prefix libomp 2>/dev/null || true)"
+    if [[ -n "$LIBOMP" && -f "$LIBOMP/lib/libomp.dylib" ]]; then
+        export CFLAGS="${CFLAGS:-} -Xpreprocessor -fopenmp -I$LIBOMP/include"
+        export CXXFLAGS="${CXXFLAGS:-} -Xpreprocessor -fopenmp -I$LIBOMP/include"
+        export LDFLAGS="${LDFLAGS:-} -L$LIBOMP/lib"
+        OPENMP_HINTS=(
+            "-DOpenMP_C_LIB_NAMES=omp"
+            "-DOpenMP_CXX_LIB_NAMES=omp"
+            "-DOpenMP_omp_LIBRARY=$LIBOMP/lib/libomp.dylib"
+            "-DOpenMP_C_FLAGS=-Xpreprocessor;-fopenmp"
+            "-DOpenMP_CXX_FLAGS=-Xpreprocessor;-fopenmp"
+        )
+    fi
+fi
+
 RANDLAPACK_CMAKE_DIR=""
 RANDLAPACK_SOURCE_NOTE=""
 
@@ -331,7 +353,8 @@ if (( FRESH )); then rm -rf "$BUILD_DIR"; fi
 
 CMAKE_ARGS=(-S "$SCRIPT_DIR" -B "$BUILD_DIR"
             -DCMAKE_BUILD_TYPE=Release
-            -DRandLAPACK_DIR="$RANDLAPACK_CMAKE_DIR")
+            -DRandLAPACK_DIR="$RANDLAPACK_CMAKE_DIR"
+            "${OPENMP_HINTS[@]}")
 if (( WANT_MATLAB )); then
     CMAKE_ARGS+=(-DMatlab_ROOT_DIR="$MATLAB_ROOT")
 fi
@@ -344,7 +367,10 @@ fi
 
 if (( WANT_PYTHON )); then
     pip_install() {
+        # scikit-build-core forwards $CMAKE_ARGS to its CMake configure, which
+        # is how the macOS OpenMP hints reach the Python build.
         RandLAPACK_DIR="$RANDLAPACK_CMAKE_DIR" \
+        CMAKE_ARGS="${OPENMP_HINTS[*]:-}" \
             "$PYTHON_BIN" -m pip install "$SCRIPT_DIR/python" -v
     }
     run_step "Installing the Python package (pip install ./python)" pip_install

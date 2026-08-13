@@ -44,10 +44,25 @@ jobs:
         run: |
           set -euo pipefail
           MATLAB_ROOT="$(dirname "$(dirname "$(command -v matlab)")")"
+          # macOS: blaspp's installed config does find_dependency(OpenMP),
+          # which stock Apple Clang cannot satisfy unaided -- every consumer
+          # of the stack needs the same libomp hints the installer used.
+          HINTS=()
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            LIBOMP="$(brew --prefix libomp)"
+            HINTS=(
+              "-DOpenMP_C_LIB_NAMES=omp"
+              "-DOpenMP_CXX_LIB_NAMES=omp"
+              "-DOpenMP_omp_LIBRARY=$LIBOMP/lib/libomp.dylib"
+              "-DOpenMP_C_FLAGS=-Xpreprocessor;-fopenmp"
+              "-DOpenMP_CXX_FLAGS=-Xpreprocessor;-fopenmp"
+            )
+          fi
           cmake -S . -B build \
             -DCMAKE_BUILD_TYPE=Release \
             -DRandLAPACK_DIR="$RandLAPACK_DIR" \
-            -DMatlab_ROOT_DIR="$MATLAB_ROOT"
+            -DMatlab_ROOT_DIR="$MATLAB_ROOT" \
+            "${HINTS[@]}"
           cmake --build build -j2
 
       - name: run MATLAB binding tests
@@ -114,7 +129,10 @@ jobs:
           export RANDNLA_PROJECT_DIR="$(cd "$GITHUB_WORKSPACE/.." && pwd)/RandNLA-project"
           export LD_LIBRARY_PATH="$BLASPP_LIB:$LAPACKPP_LIB:${LD_LIBRARY_PATH:-}"
           python -m pip install --upgrade pip pytest
-          bash bootstrap.sh --yes 2>&1 | tee bootstrap.out
+          # RandLAPACK_DIR is unset for this run on purpose: the stack action
+          # exports it, and it short-circuits the discovery path this job
+          # exists to test (the shared RandNLA-project layout probe).
+          env -u RandLAPACK_DIR bash bootstrap.sh --yes 2>&1 | tee bootstrap.out
           grep -q "reused from" bootstrap.out \
             || { echo "bootstrap did not reuse the existing RandLAPACK install"; exit 1; }
 
