@@ -30,6 +30,16 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    # macOS is non-blocking pending issue #6: MATLAB ships its OWN
+    # libomp.dylib, which wins at load time over the Homebrew libomp that
+    # blaspp was built against, and does not export the symbols blaspp needs
+    # (___kmpc_dispatch_deinit) -- so the MEX builds and then fails to
+    # dlopen. Same class as the Linux ILP64-MKL constraint: the MEX runs
+    # inside MATLAB's process and MATLAB's bundled runtime wins. The fix is
+    # a --no-openmp option in RandLAPACK's installer (blaspp already has
+    # -Duse_openmp=OFF), which is a change in another repo. Linux MATLAB,
+    # Python and bootstrap all block normally.
+    continue-on-error: ${{ matrix.os == 'macos-latest' }}
     steps:
       - uses: actions/checkout@v4
 

@@ -142,6 +142,13 @@ cmake -S . -B build ... \
     "-DOpenMP_C_FLAGS=-Xpreprocessor;-fopenmp;-I$LIBOMP/include"
 ```
 
+**macOS + MATLAB: `Invalid MEX-file ... Symbol not found: ___kmpc_dispatch_deinit`.** MATLAB
+ships its own `libomp.dylib` and loads it ahead of the Homebrew libomp that BLAS++ was built
+against; MATLAB's copy does not export the symbols BLAS++ needs, so the MEX builds and then
+fails to load. Tracked in issue #6. Until it is resolved, use the Python bindings on macOS, or
+build the stack on Linux. (The mirror image of the Linux constraint above: in both cases the
+MEX runs inside MATLAB's process and MATLAB's bundled runtime wins.)
+
 **`pip` refuses to install (`externally-managed-environment`).** Use a virtualenv; see
 Quick start.
 
@@ -153,5 +160,5 @@ commit is pinned in `bootstrap.sh` and the CI stack action, and bumped deliberat
 | OS | Bindings | BLAS | Integer width |
 |---|---|---|---|
 | Ubuntu (latest) | MATLAB (MEX) + Python | oneMKL | ILP64 (matches MATLAB's runtime MKL) |
-| macOS (latest) | MATLAB (MEX) | OpenBLAS | LP64 |
+| macOS (latest) | MATLAB (MEX) | OpenBLAS | LP64 (builds; MEX load blocked by issue #6) |
 | Ubuntu (latest) | bootstrap end-to-end | oneMKL | ILP64 |
