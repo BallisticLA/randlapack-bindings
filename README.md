@@ -138,8 +138,8 @@ LIBOMP=$(brew --prefix libomp)
 cmake -S . -B build ... \
     -DOpenMP_CXX_LIB_NAMES=omp -DOpenMP_C_LIB_NAMES=omp \
     -DOpenMP_omp_LIBRARY=$LIBOMP/lib/libomp.dylib \
-    "-DOpenMP_CXX_FLAGS=-Xpreprocessor;-fopenmp" \
-    "-DOpenMP_C_FLAGS=-Xpreprocessor;-fopenmp"
+    "-DOpenMP_CXX_FLAGS=-Xpreprocessor;-fopenmp;-I$LIBOMP/include" \
+    "-DOpenMP_C_FLAGS=-Xpreprocessor;-fopenmp;-I$LIBOMP/include"
 ```
 
 **`pip` refuses to install (`externally-managed-environment`).** Use a virtualenv; see

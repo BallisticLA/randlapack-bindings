@@ -254,8 +254,8 @@ if [[ "$(uname -s)" == "Darwin" ]] && command -v brew >/dev/null 2>&1; then
             "-DOpenMP_C_LIB_NAMES=omp"
             "-DOpenMP_CXX_LIB_NAMES=omp"
             "-DOpenMP_omp_LIBRARY=$LIBOMP/lib/libomp.dylib"
-            "-DOpenMP_C_FLAGS=-Xpreprocessor;-fopenmp"
-            "-DOpenMP_CXX_FLAGS=-Xpreprocessor;-fopenmp"
+            "-DOpenMP_C_FLAGS=-Xpreprocessor;-fopenmp;-I$LIBOMP/include"
+            "-DOpenMP_CXX_FLAGS=-Xpreprocessor;-fopenmp;-I$LIBOMP/include"
         )
     fi
 fi
