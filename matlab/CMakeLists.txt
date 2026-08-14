@@ -24,23 +24,33 @@ else()
     set(MEX_STATIC_LIBSTDCXX_FLAGS "")
 endif()
 
-matlab_add_mex(
-    NAME bqrrp_mex
-    SRC src/bqrrp_mex.cc
-    LINK_TO RandLAPACK::RandLAPACK
-    R2018a
-)
+# Every MEX target needs the same five follow-up settings, so they live in one
+# function rather than being copy-pasted per driver.
+#
 # matlab_add_mex's LINK_TO doesn't propagate INTERFACE_INCLUDE_DIRECTORIES from
 # the linked targets in all CMake versions. Expose them explicitly. We use
 # target_include_directories (not a second target_link_libraries) because
 # FindMatlab itself uses the plain (no-keyword) target_link_libraries form
 # internally and CMake disallows mixing keyword/plain calls on one target.
-target_include_directories(bqrrp_mex PRIVATE
-    $<TARGET_PROPERTY:RandLAPACK::RandLAPACK,INTERFACE_INCLUDE_DIRECTORIES>
-)
-set_target_properties(bqrrp_mex PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${MEX_OUTPUT_DIR}
-    RUNTIME_OUTPUT_DIRECTORY ${MEX_OUTPUT_DIR}
-)
-target_compile_features(bqrrp_mex PRIVATE cxx_std_20)
-target_link_options(bqrrp_mex PRIVATE ${MEX_STATIC_LIBSTDCXX_FLAGS})
+function(randlapack_configure_mex target)
+    target_include_directories(${target} PRIVATE
+        $<TARGET_PROPERTY:RandLAPACK::RandLAPACK,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    set_target_properties(${target} PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${MEX_OUTPUT_DIR}
+        RUNTIME_OUTPUT_DIRECTORY ${MEX_OUTPUT_DIR}
+    )
+    target_compile_features(${target} PRIVATE cxx_std_20)
+    target_link_options(${target} PRIVATE ${MEX_STATIC_LIBSTDCXX_FLAGS})
+endfunction()
+
+# One entry per bound driver. Sources are src/<name>_mex.cc by convention.
+foreach(driver bqrrp cqrrpt rsvd)
+    matlab_add_mex(
+        NAME ${driver}_mex
+        SRC src/${driver}_mex.cc
+        LINK_TO RandLAPACK::RandLAPACK
+        R2018a
+    )
+    randlapack_configure_mex(${driver}_mex)
+endforeach()
