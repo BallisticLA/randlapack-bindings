@@ -1,0 +1,115 @@
+name: build-randlapack-stack
+description: >
+  Provide an installed RandLAPACK (with BLAS++, LAPACK++, Random123) for the
+  bindings to find_package against, by running RandLAPACK's own installer at a
+  pinned commit. The installer owns the dependency recipe -- immutable-ref
+  pins, provenance-gated reuse, and a run-not-just-link BLAS verification --
+  so this action deliberately re-implements none of it. Linux + macOS.
+
+inputs:
+  randlapack-ref:
+    description: >
+      RandLAPACK git ref to build the bindings against. An immutable commit,
+      not a branch: bump it deliberately, in a PR whose CI run then validates
+      the bindings against the new commit.
+    default: ab05872aec1b8695e137fb3c7f29685e5399fc49
+
+runs:
+  using: composite
+  steps:
+    - name: base toolchain + BLAS
+      shell: bash
+      run: |
+        set -euo pipefail
+        if [ "$RUNNER_OS" = "Linux" ]; then
+          export DEBIAN_FRONTEND=noninteractive
+          # Intel MKL (ILP64) is the BLAS on Linux, NOT OpenBLAS: the bindings
+          # run inside MATLAB, whose runtime BLAS is MKL ILP64 (64-bit ints).
+          # blaspp must match that ABI or MATLAB's MKL services the MEX's BLAS
+          # calls with the wrong integer width (garbage leading dimension ->
+          # "Parameter N incorrect on entry to DGEMM" -> segfault).
+          # RandLAPACK's installer requests ILP64 for MKL by default and reads
+          # the built width back, so asking for --blas=mkl below yields the
+          # right ABI without further flags.
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y git-core gcc g++ gfortran cmake m4 wget gpg
+          wget -qO- https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | sudo gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list > /dev/null
+          sudo apt-get update -qq
+          sudo apt-get install -qq -y intel-oneapi-mkl-devel
+          # Source Intel's own env script (robust across versions and the
+          # 'latest' symlink), then hand the variables to later steps and the
+          # calling job. oneAPI's vars.sh reads variables that may be unset,
+          # so nounset is relaxed around the source.
+          MKL_ENV="$(ls /opt/intel/oneapi/mkl/*/env/vars.sh | sort -V | tail -1)"
+          set +u; source "$MKL_ENV"; set -u
+          MKL_LIB="$(dirname "$(find "$MKLROOT" -name 'libmkl_core.so*' | head -1)")"
+          {
+            echo "MKLROOT=$MKLROOT"
+            echo "MKL_LIB=$MKL_LIB"
+            echo "CPATH=${CPATH:-}"
+            echo "LIBRARY_PATH=${LIBRARY_PATH:-}"
+            echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
+          } >> "$GITHUB_ENV"
+        elif [ "$RUNNER_OS" = "macOS" ]; then
+          # OpenBLAS, NOT Apple Accelerate: legacy Accelerate has a broken
+          # divide-and-conquer gesdd (RandLAPACK #165) and RandLAPACK's BQRRP
+          # guard refuses it outright. This is also the macOS default of
+          # RandLAPACK's installer, for the same reason. macOS two-level
+          # namespaces keep the MEX bound to its own OpenBLAS at runtime (no
+          # MATLAB-BLAS interposition), so LP64 is fine here.
+          brew install openblas libomp
+          OB="$(brew --prefix openblas)"
+          {
+            echo "OPENBLAS_LIB=$OB/lib"
+            echo "LIBRARY_PATH=$OB/lib"
+            echo "LD_LIBRARY_PATH=$OB/lib"
+            echo "DYLD_LIBRARY_PATH=$OB/lib"
+            echo "CPATH=$OB/include"
+          } >> "$GITHUB_ENV"
+        fi
+
+    - name: clone RandLAPACK at the pinned ref
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "${{ github.workspace }}/.."
+        git clone https://github.com/BallisticLA/RandLAPACK.git
+        cd RandLAPACK
+        git checkout "${{ inputs.randlapack-ref }}"
+        git submodule update --init --recursive
+
+    - name: install the RandLAPACK stack (RandLAPACK's own installer)
+      shell: bash
+      run: |
+        set -euo pipefail
+        cd "${{ github.workspace }}/.."
+        # The installer pins blaspp/lapackpp/Random123 itself, stamps
+        # provenance, and finishes by compiling, linking and RUNNING a
+        # gemm+gesdd check against the finished install. --blas is stated
+        # explicitly rather than left to auto, because the choice is
+        # load-bearing here (see the BLAS step above).
+        if [ "$RUNNER_OS" = "Linux" ]; then BLAS=mkl; else BLAS=openblas; fi
+        bash RandLAPACK/install.sh --yes --no-gpu --no-extras --no-benchmarks \
+          --blas="$BLAS" --project-dir "$PWD/RandNLA-project"
+
+    - name: export the install locations
+      shell: bash
+      run: |
+        set -euo pipefail
+        DEPS="$(cd "${{ github.workspace }}/.." && pwd)/RandNLA-project/install"
+        # Dependency install directories carry the backend and GPU
+        # configuration in their names (blaspp-mkl-cpu-install); glob rather
+        # than hardcode so this action does not break when that naming grows.
+        BLASPP_DIR="$(echo "$DEPS"/blaspp-*-install)"
+        LAPACKPP_DIR="$(echo "$DEPS"/lapackpp-*-install)"
+        {
+          echo "RandLAPACK_DIR=$DEPS/RandLAPACK-install/lib/cmake/RandLAPACK"
+          echo "blaspp_DIR=$BLASPP_DIR/lib/cmake/blaspp"
+          echo "lapackpp_DIR=$LAPACKPP_DIR/lib/cmake/lapackpp"
+          echo "Random123_DIR=$DEPS/random123/include"
+          echo "BLASPP_LIB=$BLASPP_DIR/lib"
+          echo "LAPACKPP_LIB=$LAPACKPP_DIR/lib"
+        } >> "$GITHUB_ENV"
