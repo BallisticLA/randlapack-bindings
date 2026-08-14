@@ -1,15 +1,15 @@
-// pybind11 module entry point for the Python `randlapack` package.
+// nanobind module entry point for the Python `randlapack` package.
 //
 // Per-driver bindings (bqrrp, ...) register their functions via free
-// `register_*` functions called from PYBIND11_MODULE.
+// `register_*` functions called from NB_MODULE.
 
-#include <pybind11/pybind11.h>
+#include <nanobind/nanobind.h>
 
-namespace py = pybind11;
+namespace nb = nanobind;
 
-void register_bqrrp(py::module_& m);
+void register_bqrrp(nb::module_& m);
 
-PYBIND11_MODULE(_randlapack, m) {
+NB_MODULE(_randlapack, m) {
     m.doc() = "Python bindings for selected RandLAPACK drivers.";
 
     register_bqrrp(m);
