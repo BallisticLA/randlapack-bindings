@@ -24,6 +24,8 @@ find_package(RandLAPACK CONFIG REQUIRED)
 nanobind_add_module(_randlapack NB_STATIC
     src/randlapack_module.cc
     src/bqrrp_binding.cc
+    src/cqrrpt_binding.cc
+    src/rsvd_binding.cc
 )
 target_link_libraries(_randlapack PRIVATE RandLAPACK::RandLAPACK)
 target_compile_features(_randlapack PRIVATE cxx_std_20)

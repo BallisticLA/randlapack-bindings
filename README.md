@@ -2,8 +2,15 @@
 
 MATLAB and Python bindings for [RandLAPACK](https://github.com/BallisticLA/RandLAPACK).
 
-Currently bound: `BQRRP` (randomized blocked QR with column pivoting), single and double
-precision, real matrices. More drivers land in waves as their C++ APIs stabilize.
+Currently bound, in single and double precision, real matrices:
+
+| Driver | What it does | Shape requirement |
+|---|---|---|
+| `bqrrp` | Randomized blocked QR with column pivoting | any |
+| `cqrrpt` | Rank-revealing QRCP; discovers the numerical rank | tall (`m >= d_factor*n`) |
+| `rsvd` | Randomized truncated SVD at a target rank | any |
+
+More drivers land in waves as their C++ APIs stabilize.
 
 ## Quick start
 
@@ -76,6 +83,9 @@ err = norm(A(:, J) - Q*R, 'fro') / norm(A, 'fro');
 
 [Q, R, J]       = randlapack.bqrrp(A, 'explicit')   % default; matches qr(A, 'vector')
 [A_out, tau, J] = randlapack.bqrrp(A, 'implicit')   % GEQP3-format; skips Q materialization
+
+[U, S, V] = randlapack.rsvd(A, 50);                 % rank-50 approximate SVD
+[Q, R, J] = randlapack.cqrrpt(randn(20000, 200));   % rank revealed, not requested
 ```
 
 Python:
@@ -86,10 +96,14 @@ import numpy as np, randlapack as rl
 A = np.random.default_rng(0).standard_normal((2000, 200))
 Q, R, J = rl.bqrrp(A)
 err = np.linalg.norm(A[:, J] - Q @ R) / np.linalg.norm(A)
+
+U, s, V = rl.rsvd(A, 50)                  # A ~= U @ diag(s) @ V.T  (V, not vh)
+Q, R, J = rl.cqrrpt(np.random.default_rng(0).standard_normal((20000, 200)))
+rank = R.shape[0]                         # discovered, not requested
 ```
 
-Run `help randlapack.bqrrp` (MATLAB) or `help(rl.bqrrp)` (Python) for the full
-signatures, including block size, sketch embedding factor, and the RNG state.
+Run `help randlapack.<driver>` (MATLAB) or `help(rl.<driver>)` (Python) for the full
+signatures, the tuning knobs, and the RNG state.
 Examples live in `matlab/examples/` and `python/examples/`.
 
 ## Conventions: MATLAB vs Python
@@ -103,6 +117,8 @@ diverge. These are choices, not accidents:
 | Input layout | column-major (MATLAB's native layout) | any; C-order auto-converted via `np.asfortranarray` (one copy) |
 | RNG state | omit, a `uint32` seed, or a struct with `.counter` (`uint32[4]`) and `.key` (`uint32[2]`) | omit, an `int` seed, or a dict with `'counter'`/`'key'` |
 | Reproducibility | pass the returned state back in | same, via `return_state=True` |
+| `rsvd` singular values | `S` is a k-by-k diagonal matrix with 3 outputs, a vector with 1 (`svd` parity) | `s` is always a 1-D array (`scipy` parity) |
+| `rsvd` right factor | `V`, un-transposed: `A ~= U*S*V'` | `V`, un-transposed — **not** numpy's `vh` |
 
 The RNG is Philox4x32 (counter-based), so a given state produces the same sketch on any
 platform.
@@ -159,6 +175,6 @@ commit is pinned in `bootstrap.sh` and the CI stack action, and bumped deliberat
 
 | OS | Bindings | BLAS | Integer width |
 |---|---|---|---|
-| Ubuntu (latest) | MATLAB (MEX) + Python | oneMKL | ILP64 (matches MATLAB's runtime MKL) |
-| macOS (latest) | MATLAB (MEX) | OpenBLAS | LP64 (builds; MEX load blocked by issue #6) |
+| Ubuntu (latest) | MATLAB (MEX) + Python, all drivers | oneMKL | ILP64 (matches MATLAB's runtime MKL) |
+| macOS (latest) | MATLAB (MEX), all drivers | OpenBLAS | LP64 (builds; MEX load blocked by issue #6) |
 | Ubuntu (latest) | bootstrap end-to-end | oneMKL | ILP64 |

@@ -78,7 +78,7 @@ jobs:
       - name: run MATLAB binding tests
         uses: matlab-actions/run-command@v2
         with:
-          command: "addpath('matlab'); addpath('matlab/tests'); test_bqrrp; disp('matlab binding tests passed');"
+          command: "addpath('matlab'); addpath('matlab/tests'); test_bqrrp; test_cqrrpt; test_rsvd; disp('matlab binding tests passed');"
         env:
           # The MEX dynamically links blaspp/lapackpp; set BOTH search-path
           # vars (Linux uses LD_LIBRARY_PATH, macOS uses DYLD_LIBRARY_PATH).

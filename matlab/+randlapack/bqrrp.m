@@ -50,7 +50,7 @@ function [out1, out2, J, state_out] = bqrrp(A, varargin)
     % pass a smaller value to actually exercise the blocked structure.
     b_sz     = int64(min(m, n));
     d_factor = cast(1.25, class(A));
-    state    = make_default_state();
+    state    = rl_default_state();
     mode     = 'explicit';
 
     % --- Argument parsing ---
@@ -75,7 +75,7 @@ function [out1, out2, J, state_out] = bqrrp(A, varargin)
         d_factor = cast(positional{2}, class(A));
     end
     if numel(positional) >= 3 && ~isempty(positional{3})
-        state = normalize_state(positional{3});
+        state = rl_normalize_state(positional{3}, mfilename);
     end
     if numel(positional) >= 4
         error('randlapack:bqrrp:nargin', ...
@@ -105,32 +105,3 @@ function [out1, out2, J, state_out] = bqrrp(A, varargin)
     [out1, out2, J, state_out] = bqrrp_mex(A, b_sz, d_factor, state, mode);
 end
 
-
-function state = make_default_state()
-    state.counter = uint32([0, 0, 0, 0]);
-    state.key     = uint32([0, 0]);
-end
-
-
-function state = normalize_state(in)
-    if isstruct(in)
-        if ~isfield(in, 'counter') || ~isfield(in, 'key')
-            error('randlapack:bqrrp:state', ...
-                  'state struct must have fields .counter and .key');
-        end
-        validateattributes(in.counter, {'uint32'}, {'vector', 'numel', 4}, ...
-                           mfilename, 'state.counter');
-        validateattributes(in.key,     {'uint32'}, {'vector', 'numel', 2}, ...
-                           mfilename, 'state.key');
-        state.counter = uint32(in.counter(:)).';
-        state.key     = uint32(in.key(:)).';
-    elseif isnumeric(in) && isscalar(in)
-        % Treat scalar as a seed; place in key[1]. Counter starts at zero.
-        seed = uint32(in);
-        state.counter = uint32([0, 0, 0, 0]);
-        state.key     = uint32([0, seed]);
-    else
-        error('randlapack:bqrrp:state', ...
-              'state must be a struct or a scalar seed');
-    end
-end
