@@ -27,6 +27,16 @@ cmake -S . -B build \
 cmake --build build -j
 ```
 
+On Windows, run from an x64 developer shell and pass two extra things:
+`-G Ninja` and `-DRANDLAPACK_RUNTIME_DLL_DIRS=<BLAS backend bin dir>` (the
+RandLAPACK installer prints that directory). `-G Ninja` is REQUIRED, not a
+preference: without it CMake selects the multi-config Visual Studio generator,
+which appends a `Debug\`/`Release\` subdirectory to the MEX output path, so the
+MEX lands in `matlab/+randlapack/private/Debug/` where MATLAB's package loader
+never looks (verified 2026-08-19; Ninja ships with the VS "C++ CMake tools"
+component). The DLL-dirs flag stages the BLAS runtime next to the MEX; without
+it MATLAB fails to load the MEX with "The specified module could not be found".
+
 If MATLAB is not found, MEX targets are skipped with a clear warning; the `.m` files still ship and can be used once the MEX is built. On success, the per-driver MEX (`matlab/+randlapack/private/{bqrrp,fun_nystrom_pp}_mex.<ext>`) is in place.
 
 ### Prebuilt release (no compiler, no CMake)
