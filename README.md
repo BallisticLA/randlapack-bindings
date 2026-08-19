@@ -22,10 +22,15 @@ More drivers as their C++ APIs stabilize.
 
 ```sh
 cmake -S . -B build \
+    -DCMAKE_BUILD_TYPE=Release \
     -DRandLAPACK_DIR=/path/to/RandLAPACK-install/lib/cmake/RandLAPACK \
     -DMatlab_ROOT_DIR=/path/to/MATLAB
 cmake --build build -j
 ```
+
+Always pass `-DCMAKE_BUILD_TYPE=Release`: with no build type the MEX compiles
+without optimization (and Ninja+MSVC even defaults to Debug, measured
+2026-08-19), which is functionally correct but useless for timing.
 
 On Windows, run from an x64 developer shell and pass two extra things:
 `-G Ninja` and `-DRANDLAPACK_RUNTIME_DLL_DIRS=<BLAS backend bin dir>` (the
