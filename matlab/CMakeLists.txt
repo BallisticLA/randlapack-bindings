@@ -44,6 +44,14 @@ set_target_properties(bqrrp_mex PROPERTIES
 )
 target_compile_features(bqrrp_mex PRIVATE cxx_std_20)
 target_link_options(bqrrp_mex PRIVATE ${MEX_STATIC_LIBSTDCXX_FLAGS})
+# Windows: stage the BLAS backend's runtime DLLs next to the MEX. MATLAB loads
+# a MEX with the MEX file's own directory on the DLL search path, so app-local
+# staging (the idiomatic Windows layout RandLAPACK's installer uses for its own
+# executables) makes the MEX loadable without PATH edits. The helper is a
+# no-op off Windows and only exists in RandLAPACK installs that export it.
+if(COMMAND randlapack_stage_runtime_dlls)
+    randlapack_stage_runtime_dlls(bqrrp_mex)
+endif()
 
 matlab_add_mex(
     NAME fun_nystrom_pp_mex
@@ -60,3 +68,21 @@ set_target_properties(fun_nystrom_pp_mex PROPERTIES
 )
 target_compile_features(fun_nystrom_pp_mex PRIVATE cxx_std_20)
 target_link_options(fun_nystrom_pp_mex PRIVATE ${MEX_STATIC_LIBSTDCXX_FLAGS})
+if(COMMAND randlapack_stage_runtime_dlls)
+    randlapack_stage_runtime_dlls(fun_nystrom_pp_mex)
+endif()
+
+# Windows: MATLAB's process already hosts Intel's OpenMP runtime (libiomp5md),
+# and a MEX compiled with /openmp:llvm injects MSVC's libomp140; two OpenMP
+# runtimes in one process abort at load (OMP Error #15). Intel's runtime and
+# LLVM's implement the same kmpc ABI (LLVM's libomp descends from Intel's), so
+# the supported MEX configuration is: satisfy the OpenMP references from
+# MATLAB's own import library (shipped in bin/win64 for exactly this purpose)
+# and suppress the compiler's default runtime. Plain target_link_libraries
+# form, matching FindMatlab's internal usage (keyword/plain forms cannot mix).
+if(WIN32)
+    foreach(mex_tgt IN ITEMS bqrrp_mex fun_nystrom_pp_mex)
+        target_link_libraries(${mex_tgt} "${Matlab_ROOT_DIR}/bin/win64/libiomp5md.lib")
+        target_link_options(${mex_tgt} PRIVATE "/nodefaultlib:libomp140.x86_64.lib")
+    endforeach()
+endif()
