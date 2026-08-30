@@ -6,9 +6,15 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %   [est, t1, t2, times] = randlapack.fun_nystrom_pp(...)
 %       the 4th output is a wall-clock instrumentation struct (fields:
 %       marshal_in_ms, phase1_ms, phase2_ms, fafun_ms, assembly_ms,
-%       specrec_ms, nystrom_us (1x11), lfa_us (1x5), d_used, oracle_mv,
-%       auto_k, auto_s, probe_mv) for performance breakdowns and matvec
-%       accounting. See fun_nystrom_pp_mex.cc for slot definitions.
+%       specrec_ms, nystrom_us (1x11; only slots 1,2,3,7,11 populated, slot 7
+%       = the whole spectral-recovery block), lfa_us (1x6; slot 6 = reorth
+%       time, real for scalar/block/block_qfa, 0 for the basis-free
+%       scalar_qfa/auto), d_used, oracle_mv, auto_k, auto_s, probe_mv, plus
+%       path-specific fields that are NaN when their path did not run:
+%       tr_U, tr_L, certified ('block_qfa' Gauss/Radau traces + bracket flag)
+%       and probe_ms, probe_converged, phase2_certified ('auto' depth-probe
+%       wall-clock + certification flags). See fun_nystrom_pp_mex.cc for the
+%       full slot definitions.
 %
 %   A        n x n matrix, single or double (symmetric; both triangles are
 %            used by the sparse sketch application — the MEX mirrors
@@ -36,6 +42,15 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %                   matrix-free Krylov oracle).
 %                   'block_qfa' = block Lanczos-QFA: forms the s×s quadratic
 %                   form Ω₂ᵀf(A)Ω₂ directly (no f(A)·Ω₂ mapback); cheapest.
+%                   'Adaptive' selects its depth rule: 0 = fixed Depth;
+%                   1 = Radau-certified stop (the block Gauss/Gauss-Radau
+%                   bracket closes within 'AdaptiveTol' — the same certified
+%                   meaning as scalar_qfa's adaptive mode; no delay window);
+%                   2 = legacy window rule (honors AdaptiveDelay/AdaptiveMin).
+%                   With Adaptive = 1, 'RadauReturn' picks the returned value
+%                   (0 = block Gauss, 1 = (Gauss+Radau)/2 midpoint) and the
+%                   times struct reports the tr_U >= tr_L bracket plus the
+%                   certified flag.
 %                   'scalar_qfa' = scalar Lanczos-QFA: the per-probe quadratic
 %                   forms directly (basis-free, O(n·s) memory). With
 %                   'Adaptive',1 each probe stops at its own depth via the
@@ -54,17 +69,34 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %                   Depth/Reorth/Adaptive* are ignored), running the certified
 %                   scalar QFA for both the depth probe and Phase 2. The times
 %                   struct reports the choices (auto_k, auto_s, d_used,
-%                   probe_mv, oracle_mv); spend closes as an upper bound
+%                   probe_mv, oracle_mv), the depth-probe wall-clock
+%                   (probe_ms; the probe runs before phase1_ms's clock, so
+%                   phase1_ms + phase2_ms excludes it) and the certification
+%                   flags (probe_converged, phase2_certified); spend closes
+%                   as an upper bound
 %                   probe_mv + q*auto_k + oracle_mv <= Budget (Phase 1 costs
-%                   q*auto_k matvecs; q = 1 here).
-%     'Depth'       Lanczos depth for 'scalar' / 'scalar_qfa' / 'block' LFAType
-%                   (default 200 for scalar/scalar_qfa, 20 for block; a CAP in
-%                   the adaptive QFA modes; ignored for 'exact')
+%                   q*auto_k matvecs; q = 1 here). An infeasible Budget
+%                   raises error id 'randlapack:fun_nystrom_pp:infeasibleBudget'.
+%     'Depth'       Lanczos depth for 'scalar' / 'scalar_qfa' / 'block' /
+%                   'block_qfa' LFAType (default 200 for scalar/scalar_qfa,
+%                   20 for block AND block_qfa; a CAP in the adaptive QFA
+%                   modes; ignored for 'exact')
+%     'RadauReturn' block_qfa + Adaptive 1 only: value returned on a certified
+%                   stop. 0 = block Gauss (default; matches the scalar
+%                   oracle), 1 = (Gauss + Radau)/2 midpoint (for operator-
+%                   monotone f the two quadratures err on opposite sides, so
+%                   the midpoint halves the one-sided Gauss bias for free).
+%     'AutoDepthCap' LFAType 'auto' only: fixed cap on the depth probe
+%                   (default 0 = no fixed cap; the probe is then bounded only
+%                   by n and by AutoProbeFrac).
+%     'AutoProbeFrac' LFAType 'auto' only: fraction of the matvec Budget the
+%                   depth probe may spend, in (0, 1) (default 0.125).
 %     'Sketch'      DEPRECATED/IGNORED (default 'saso'). The Phase-1 sketch is
 %                   always the kernel-internal SASO; anything other than 'saso'
 %                   triggers a warning from the MEX. Kept so existing call
 %                   sites keep running.
-%     'VecNnz'      nonzeros per column of the SASO sketch (default 8)
+%     'VecNnz'      nonzeros per column of the SASO sketch (default 8;
+%                   0 = auto, resolved to ~log(k) inside the kernel)
 %     'SketchSeed'  RNG seed for the Phase-1 sketch (default 42)
 %
 %   Returns:
@@ -125,11 +157,16 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     addParameter(p, 'LFAType',    'block',    @(x) ischar(x) || isstring(x));
     addParameter(p, 'Depth',      [],         @(x) isempty(x) || (isnumeric(x) && isscalar(x) && x >= 1));
     addParameter(p, 'Sketch',     'saso',     @(x) ischar(x) || isstring(x));
-    addParameter(p, 'VecNnz',     8,          @(x) isnumeric(x) && isscalar(x) && x >= 1);
+    % VecNnz 0 = auto (~log k, resolved inside the kernel).
+    addParameter(p, 'VecNnz',     8,          @(x) isnumeric(x) && isscalar(x) && x >= 0);
     addParameter(p, 'SketchSeed', 42,         @(x) isnumeric(x) && isscalar(x) && x >= 0);
     addParameter(p, 'Reorth',     1,          @(x) isnumeric(x) && isscalar(x));
-    addParameter(p, 'Adaptive',   0,          @(x) isnumeric(x) && isscalar(x));
+    % QFA depth rule: 0 = fixed Depth; 1 = Radau-certified; 2 = legacy window
+    % (block_qfa only; scalar_qfa treats any nonzero as certified adaptive).
+    addParameter(p, 'Adaptive',   0,          @(x) isnumeric(x) && isscalar(x) && any(x == [0 1 2]));
     addParameter(p, 'AdaptiveTol',1e-2,       @(x) isnumeric(x) && isscalar(x) && x > 0);
+    % block_qfa certified return value: 0 = block Gauss, 1 = midpoint.
+    addParameter(p, 'RadauReturn', 0,         @(x) isnumeric(x) && isscalar(x) && any(x == [0 1]));
     % Certificate window for block_qfa adaptive (0 = MEX/library default). The
     % first convergence test is at depth AdaptiveMin + AdaptiveDelay.
     addParameter(p, 'AdaptiveDelay', 0,       @(x) isnumeric(x) && isscalar(x) && x >= 0);
@@ -139,6 +176,10 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     % Depth/Reorth/Adaptive are ignored in this mode).
     addParameter(p, 'Budget',  0,             @(x) isnumeric(x) && isscalar(x) && x >= 0);
     addParameter(p, 'AutoEps', 1e-3,          @(x) isnumeric(x) && isscalar(x) && x > 0 && x < 1);
+    % Auto-tier probe knobs: a fixed cap on the probe depth (0 = no fixed cap)
+    % and the fraction of the Budget the probe may spend, in (0, 1).
+    addParameter(p, 'AutoDepthCap',  0,       @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    addParameter(p, 'AutoProbeFrac', 0.125,   @(x) isnumeric(x) && isscalar(x) && x > 0 && x < 1);
     parse(p, varargin{:});
 
     func     = char(p.Results.Func);
@@ -153,8 +194,11 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     adapt_tol = double(p.Results.AdaptiveTol);
     adapt_dl  = double(p.Results.AdaptiveDelay);
     adapt_mn  = double(p.Results.AdaptiveMin);
+    radau_ret = double(p.Results.RadauReturn);
     budget    = double(p.Results.Budget);
     auto_eps  = double(p.Results.AutoEps);
+    auto_dcap = double(p.Results.AutoDepthCap);
+    auto_pfr  = double(p.Results.AutoProbeFrac);
     if strcmp(lfa_type, 'auto') && budget < 1
         error('randlapack:fun_nystrom_pp:Budget', ...
               'LFAType ''auto'' requires a positive ''Budget'' (total A-matvec budget).');
@@ -168,17 +212,17 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     % A is templated on by the MEX; keep it in the working precision.
     A = cast(A, cls);
 
+    mex_args = {A, a1, a2, func, q, pl, lfa_type, d, ...
+                sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, ...
+                adapt_dl, adapt_mn, budget, auto_eps, radau_ret, ...
+                auto_dcap, auto_pfr};
     if nargout <= 1
-        est = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                 sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn, budget, auto_eps);
+        est = fun_nystrom_pp_mex(mex_args{:});
     elseif nargout == 2
-        [est, t1] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                       sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn, budget, auto_eps);
+        [est, t1] = fun_nystrom_pp_mex(mex_args{:});
     elseif nargout == 3
-        [est, t1, t2] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                           sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn, budget, auto_eps);
+        [est, t1, t2] = fun_nystrom_pp_mex(mex_args{:});
     else
-        [est, t1, t2, times] = fun_nystrom_pp_mex(A, a1, a2, func, q, pl, lfa_type, d, ...
-                                                  sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, adapt_dl, adapt_mn, budget, auto_eps);
+        [est, t1, t2, times] = fun_nystrom_pp_mex(mex_args{:});
     end
 end

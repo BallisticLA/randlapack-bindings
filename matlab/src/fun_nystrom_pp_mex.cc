@@ -4,7 +4,10 @@
 // MATLAB-side signature (low-level; users normally call randlapack.fun_nystrom_pp.m):
 //
 //   [est, t1, t2] = fun_nystrom_pp_mex(A, arg1, arg2, func, q, poly_lambda, lfa_type, d, ...
-//                                      sketch_type, vec_nnz, sketch_seed)
+//                                      sketch_type, vec_nnz, sketch_seed, reorth, ...
+//                                      adaptive, adaptive_tol, adaptive_delay, ...
+//                                      adaptive_min, budget, auto_eps, radau_return, ...
+//                                      auto_depth_cap, auto_probe_frac)
 //
 // where:
 //   A           n x n matrix, single or double, column-major. BOTH triangles are
@@ -37,19 +40,44 @@
 //                            recurrence is intrinsically no-reorth).
 //                 block:  block Lanczos-FA at depth d (BLAS-3 accelerated variant)
 //                 block_qfa: block Lanczos-QFA — forms Ω₂ᵀf(A)Ω₂ (s×s) directly,
-//                            skipping the f(A)·Ω₂ mapback (driver.use_qfa = true)
+//                            skipping the f(A)·Ω₂ mapback (driver.use_qfa = true).
+//                            Input 13 (adaptive) selects the depth rule:
+//                              0 = fixed depth d;
+//                              1 = Radau-certified stop (stop_rule = Radau: the
+//                                  block Gauss / Gauss-Radau bracket closes
+//                                  within adaptive_tol — the same certified
+//                                  meaning as scalar_qfa's adaptive mode; no
+//                                  delay window);
+//                              2 = legacy window rule (stop_rule = Window;
+//                                  honors adaptive_delay / adaptive_min).
+//                            Input 19 (radau_return) selects the value returned
+//                            on a certified stop: 0 = block Gauss (default),
+//                            1 = (Gauss + Radau)/2 midpoint.
 //                 auto:   knob-free tier. The driver picks k, s, and the oracle
 //                         depth from (budget, auto_eps) [inputs 17, 18], running
 //                         the certified scalar QFA for both the depth probe and
 //                         Phase 2; the positional k/s/d/reorth/adaptive inputs
-//                         are IGNORED.
+//                         are IGNORED. Inputs 20/21 (auto_depth_cap,
+//                         auto_probe_frac) tune the depth probe. An infeasible
+//                         budget raises MATLAB error id
+//                         'randlapack:fun_nystrom_pp:infeasibleBudget'.
 //   d           Lanczos depth (used for lfa_type in {scalar, scalar_qfa, block,
 //               block_qfa}; the adaptive QFA modes treat it as a depth CAP)
 //   sketch_type IGNORED (accepted for call-site compatibility; the Phase-1
 //               sketch is always the kernel-internal SASO). A MATLAB warning is
 //               issued if anything other than 'saso' is passed explicitly.
-//   vec_nnz     nonzeros per column of the SASO sketch (default 8)  [optional, input 10]
+//   vec_nnz     nonzeros per column of the SASO sketch (default 8; 0 = auto,
+//               resolved to ~log(k) inside NystromEVD)   [optional, input 10]
 //   sketch_seed RNG seed for the Phase-1 sketch (default 42)        [optional, input 11]
+//   ...         optional inputs 12-18 (reorth, adaptive, adaptive_tol,
+//               adaptive_delay, adaptive_min, budget, auto_eps) are documented
+//               inline where they are read in run_fun_nystrom below.
+//   radau_return    block_qfa certified return value: 0 = Gauss (default),
+//                   1 = midpoint                        [optional, input 19]
+//   auto_depth_cap  'auto' tier: fixed cap on the probe depth (0 = no fixed
+//                   cap, the default)                   [optional, input 20]
+//   auto_probe_frac 'auto' tier: fraction of the matvec budget the depth
+//                   probe may spend, in (0, 1) (default 0.125) [optional, input 21]
 //
 // Outputs:
 //   est         trace estimate t1 + t2 (scalar double)
@@ -62,17 +90,25 @@
 //                 fafun_ms       time inside the f(A)*X oracle (subset of phase2)
 //                 assembly_ms    phase2_ms - fafun_ms (trace assembly)
 //                 specrec_ms     spectral-recovery block inside NystromEVD
-//                 nystrom_us     1x11 NystromEVD breakdown (microseconds):
-//                                [alloc syrf matvec gram potrf trsm svd post_svd
-//                                 err_est rest total]
+//                 nystrom_us     1x11 NystromEVD breakdown (microseconds).
+//                                Only slots 0, 1, 2, 6, 10 (C++ 0-based; MATLAB
+//                                indices 1, 2, 3, 7, 11) are populated:
+//                                slot 0 = alloc, 1 = syrf (QR stabilization),
+//                                2 = matvec, 6 = the WHOLE shifted spectral-
+//                                recovery block (Alg. 2 lines 3-8, not just an
+//                                svd), 10 = total. The remaining slots are 0.
 //                 lfa_us         1x6 Lanczos-oracle breakdown (microseconds):
-//                                slot 6 = reorthogonalization (FA only; 0 for QFA,
-//                                which has no reorth by design)
-//                                [matvec run_lanczos apply rest total]
+//                                [matvec run_lanczos apply rest total reorth]
 //                                for lfa_type 'scalar'/'scalar_qfa'/'block'/
 //                                'block_qfa'/'auto' (for the QFA types, apply =
 //                                certificate checks + final quadrature evals;
-//                                zeros for 'exact')
+//                                zeros for 'exact'). Slot 6 (reorth) is the
+//                                recurrence's reorthogonalization time; it is
+//                                real for 'scalar'/'block'/'block_qfa' (the
+//                                block QFA reuses the FA recurrence and pays
+//                                reorth whenever reorth = 1) and 0 for
+//                                'scalar_qfa'/'auto' (basis-free recurrence,
+//                                no reorth by design).
 //                 d_used         Lanczos depth the oracle actually used. For
 //                                'block_qfa' + adaptive this is the online-chosen
 //                                depth (<= d cap); for 'scalar_qfa' + adaptive it
@@ -80,10 +116,12 @@
 //                                it is the probe-discovered depth cap t; otherwise
 //                                it equals the fixed d.
 //                 oracle_mv      total A-matvecs the Phase-2 oracle actually
-//                                spent (Σ per-probe depths) for 'scalar_qfa' and
-//                                'auto'; 0 for the other types (their count is
-//                                the analytic s*d_used). The benchmark should
-//                                prefer this over d_used-based re-costing.
+//                                spent: Σ per-probe depths for 'scalar_qfa' and
+//                                'auto'; s*d_used for 'block_qfa' (the class's
+//                                matvecs member); 0 for 'exact'/'scalar'/'block'
+//                                (their count is the analytic s*d_used). The
+//                                benchmark should prefer this over d_used-based
+//                                re-costing.
 //                 auto_k         'auto' only: chosen Nystrom rank (else 0)
 //                 auto_s         'auto' only: chosen probe count (else 0)
 //                 probe_mv       'auto' only: matvecs the depth probe actually
@@ -91,6 +129,30 @@
 //                                budget closes as an upper bound:
 //                                probe_mv + q*auto_k + oracle_mv <= budget
 //                                (Phase 1 costs q*auto_k matvecs, q=1 here).
+//
+//               New fields below use the NaN convention: NaN when the path
+//               that produces them did not run (instead of a fake 0, which
+//               would be indistinguishable from a real measurement).
+//                 tr_U           'block_qfa' only: final block Gauss trace of
+//                                Ω₂ᵀf(A)Ω₂ (upper side of the Radau bracket
+//                                when Adaptive = 1); NaN otherwise.
+//                 tr_L           'block_qfa' only: final block Gauss-Radau
+//                                trace (lower side; equals tr_U when no
+//                                certificate ran); NaN otherwise.
+//                 certified      'block_qfa' only: 1 if the Radau bracket
+//                                closed within adaptive_tol, 0 if not (fixed
+//                                depth, Window rule, or an uncertified run to
+//                                the cap); NaN otherwise.
+//                 probe_ms       'auto' only: wall-clock of the depth probe
+//                                (runs BEFORE phase1_ms's clock starts, so
+//                                phase1_ms + phase2_ms excludes it); NaN
+//                                otherwise.
+//                 probe_converged   'auto' only: 1 if every probe column
+//                                certified before the probe cap; NaN otherwise.
+//                 phase2_certified  'auto' only: 1 if every Phase-2 oracle
+//                                column certified at its depth cap (distinct
+//                                from probe_converged, which names ONLY the
+//                                probe); NaN otherwise.
 //
 // A may be single or double; the computation runs in that precision and the
 // scalar outputs are returned as double. Omega1/Omega2 must match the class
@@ -109,11 +171,33 @@
 #include <cstdint>
 #include <cstring>
 #include <functional>
+#include <limits>
+#include <memory>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace linops  = RandLAPACK::linops;
 namespace testing = RandLAPACK::testing;
+
+namespace {
+// Carrier for MATLAB errors raised inside the MEX. raise() throws this and
+// operator() converts it to feval('error', id, msg) as the LAST action. The
+// former design called feval directly from raise(): the engine's
+// MATLABException then re-entered operator()'s catch chain, where the typed
+// catch (const matlab::Exception&) fails to match it (this MEX statically
+// links libstdc++ while MATLAB's process carries its own copy, and typed
+// catches of foreign classes are unreliable across the two RTTI domains), so
+// the exception fell into catch (const std::exception&) and EVERY error id
+// degraded to the generic StdError. A TU-local type in an anonymous
+// namespace has its typeinfo wholly inside this MEX, so its catch always
+// matches, and the terminal feval exception escapes operator() with no
+// handler left to clobber the id.
+struct MexError {
+    std::string id;
+    std::string msg;
+};
+} // namespace
 
 using matlab::mex::ArgumentList;
 using matlab::data::Array;
@@ -128,10 +212,18 @@ private:
     std::shared_ptr<matlab::engine::MATLABEngine> matlabPtr;
     ArrayFactory factory;
 
-    // Raise a MATLAB error with a given identifier and message. Delegates to
-    // MATLAB's `error` builtin via feval, which raises a MATLABException that
-    // propagates back through the MEX boundary.
+    // Raise a MATLAB error with a given identifier and message. Throws the
+    // TU-local MexError; operator() catches it and emits the actual MATLAB
+    // error (see the MexError comment for why the feval must happen there).
     [[noreturn]] void raise(const std::string& id, const std::string& msg) {
+        throw MexError{id, msg};
+    }
+
+    // Terminal error emission: feval('error', id, msg) raises a MATLAB-side
+    // error whose engine exception propagates out of the MEX unhandled,
+    // which is exactly what delivers the id to the MATLAB caller. Called
+    // only from operator()'s catch handlers.
+    [[noreturn]] void emit_matlab_error(const std::string& id, const std::string& msg) {
         matlabPtr->feval(u"error", 0, std::vector<Array>{
             factory.createCharArray(id),
             factory.createCharArray(msg)
@@ -148,24 +240,40 @@ private:
         return ca.toAscii();
     }
 
-    int64_t read_int(const Array& a, const std::string& field) {
-        if (a.getNumberOfElements() != 1) {
-            raise("randlapack:fun_nystrom_pp_mex:scalar", field + " must be a scalar");
-        }
-        TypedArray<double> v = a;
-        return static_cast<int64_t>(v[0]);
-    }
-
+    // Any real numeric scalar class is accepted (double, single, and the
+    // signed/unsigned integer classes): a direct MEX call with int32(60) or
+    // single(1e-2) is legitimate, and the Data API's TypedArray<double>
+    // conversion throws InvalidArrayTypeException on anything but double.
     double read_double(const Array& a, const std::string& field) {
         if (a.getNumberOfElements() != 1) {
             raise("randlapack:fun_nystrom_pp_mex:scalar", field + " must be a scalar");
         }
-        TypedArray<double> v = a;
-        return v[0];
+        switch (a.getType()) {
+            case ArrayType::DOUBLE: { TypedArray<double>   v = a; return static_cast<double>(v[0]); }
+            case ArrayType::SINGLE: { TypedArray<float>    v = a; return static_cast<double>(v[0]); }
+            case ArrayType::INT8:   { TypedArray<int8_t>   v = a; return static_cast<double>(v[0]); }
+            case ArrayType::INT16:  { TypedArray<int16_t>  v = a; return static_cast<double>(v[0]); }
+            case ArrayType::INT32:  { TypedArray<int32_t>  v = a; return static_cast<double>(v[0]); }
+            case ArrayType::INT64:  { TypedArray<int64_t>  v = a; return static_cast<double>(v[0]); }
+            case ArrayType::UINT8:  { TypedArray<uint8_t>  v = a; return static_cast<double>(v[0]); }
+            case ArrayType::UINT16: { TypedArray<uint16_t> v = a; return static_cast<double>(v[0]); }
+            case ArrayType::UINT32: { TypedArray<uint32_t> v = a; return static_cast<double>(v[0]); }
+            case ArrayType::UINT64: { TypedArray<uint64_t> v = a; return static_cast<double>(v[0]); }
+            default:
+                raise("randlapack:fun_nystrom_pp_mex:scalar",
+                      field + " must be a real numeric scalar");
+        }
     }
 
-    // Copy a TypedArray<T> column-major into a fresh heap buffer (raw new[];
-    // caller frees with delete[], RandLAPACK style). MATLAB arrays are
+    int64_t read_int(const Array& a, const std::string& field) {
+        return static_cast<int64_t>(read_double(a, field));
+    }
+
+    // Copy a TypedArray<T> column-major into a fresh heap buffer, owned by a
+    // std::unique_ptr<T[]> so that every raise() (which throws through this
+    // frame) and any exception out of driver.call frees it — the raw
+    // new[]/delete[] form leaked n^2 + n*s elements on every error path after
+    // the marshal. MATLAB arrays are
     // column-major and contiguous, so we bulk-copy the whole buffer in one
     // shot; &*begin() is the contiguous storage of a full array, so a single
     // memcpy replaces a per-element loop (a measured marshal bottleneck at
@@ -179,10 +287,10 @@ private:
     // overload reads the shared buffer in place, so the input A is copied once,
     // not twice — this is the dominant piece of the flat marshal cost at n=3000.
     template <typename T>
-    T* copy_into(const Array& in, size_t n_elems) {
-        T* out = new T[n_elems];
+    std::unique_ptr<T[]> copy_into(const Array& in, size_t n_elems) {
+        std::unique_ptr<T[]> out(new T[n_elems]);
         const TypedArray<T> typed = in;
-        std::memcpy(out, &*typed.cbegin(), n_elems * sizeof(T));
+        std::memcpy(out.get(), &*typed.cbegin(), n_elems * sizeof(T));
         return out;
     }
 
@@ -197,10 +305,12 @@ private:
         const auto t_marshal_start = std::chrono::steady_clock::now();
         using RNG = r123::Philox4x32;
 
-        // A: n x n
+        // A: n x n (RAII-owned; freed on every exit path, including raise()
+        // and exceptions out of driver.call)
         const Array& A_in = inputs[0];
         const int64_t n = static_cast<int64_t>(A_in.getDimensions()[0]);
-        T* A_buf = copy_into<T>(A_in, static_cast<size_t>(n) * n);
+        std::unique_ptr<T[]> A_own = copy_into<T>(A_in, static_cast<size_t>(n) * n);
+        T* A_buf = A_own.get();
 
         // scalar params (read before sketch handling: internal sampling needs them)
         const std::string func        = read_string(inputs[3], "func");
@@ -229,6 +339,35 @@ private:
         // positional k/s/d/reorth/adaptive inputs are ignored in this mode.
         const int64_t     auto_budget = (inputs.size() >= 17) ? read_int(inputs[16], "budget") : 0;
         const double      auto_eps    = (inputs.size() >= 18) ? read_double(inputs[17], "auto_eps") : 1e-3;
+        // Certified-return selector (block_qfa adaptive = 1 only): 0 = block
+        // Gauss, 1 = (Gauss + Radau)/2 midpoint.
+        const int64_t     radau_ret   = (inputs.size() >= 19) ? read_int(inputs[18], "radau_return") : 0;
+        // Auto-tier probe knobs: a fixed cap on the probe depth (0 = no fixed
+        // cap) and the fraction of the budget the probe may spend, in (0, 1).
+        const int64_t     auto_dcap   = (inputs.size() >= 20) ? read_int(inputs[19], "auto_depth_cap") : 0;
+        const double      auto_pfrac  = (inputs.size() >= 21) ? read_double(inputs[20], "auto_probe_frac") : 0.125;
+
+        if (adaptive_fl < 0 || adaptive_fl > 2) {
+            raise("randlapack:fun_nystrom_pp_mex:adaptive",
+                  "adaptive (input 13) must be 0 (fixed depth), 1 (Radau-certified), "
+                  "or 2 (legacy window; block_qfa only)");
+        }
+        if (radau_ret != 0 && radau_ret != 1) {
+            raise("randlapack:fun_nystrom_pp_mex:radau_return",
+                  "radau_return (input 19) must be 0 (Gauss) or 1 (midpoint)");
+        }
+        if (auto_dcap < 0) {
+            raise("randlapack:fun_nystrom_pp_mex:auto_depth_cap",
+                  "auto_depth_cap (input 20) must be >= 0 (0 = no fixed cap)");
+        }
+        if (!(auto_pfrac > 0.0 && auto_pfrac < 1.0)) {
+            raise("randlapack:fun_nystrom_pp_mex:auto_probe_frac",
+                  "auto_probe_frac (input 21) must lie in (0, 1)");
+        }
+        if (vec_nnz < 0) {
+            raise("randlapack:fun_nystrom_pp_mex:vec_nnz",
+                  "vec_nnz (input 10) must be >= 0 (0 = auto, ~log(k))");
+        }
 
         if (inputs.size() >= 9 && sketch_type != "saso") {
             matlabPtr->feval(u"warning", 0, std::vector<Array>{
@@ -251,15 +390,28 @@ private:
         const Array& O2_in = inputs[2];
         const bool phase2_skipped = (k == n);
         int64_t s = 0;
+        std::unique_ptr<T[]> O2_own;   // RAII: freed on every exit path
         T* O2_buf = nullptr;
         if (!phase2_skipped) {
             if (O2_in.getNumberOfElements() == 1) {
                 s = read_int(O2_in, "s");
+                if (s < 1) {
+                    raise("randlapack:fun_nystrom_pp_mex:s_range",
+                          "s (arg 3 scalar) must be >= 1 when k < n");
+                }
                 // O2_buf = nullptr -> the driver generates the normalized
                 // Gaussian probes internally (point 3 of the 2026-07-09 plan).
             } else {
                 s = static_cast<int64_t>(O2_in.getDimensions()[1]);
-                O2_buf = copy_into<T>(O2_in, static_cast<size_t>(n) * s);
+                if (s < 1) {
+                    // An n x 0 array would otherwise flow into t2 = .../0 = NaN
+                    // with no error raised.
+                    raise("randlapack:fun_nystrom_pp_mex:Omega2_empty",
+                          "explicit Omega2 (arg 3 matrix) must have s >= 1 "
+                          "columns when k < n; got an n x 0 array");
+                }
+                O2_own = copy_into<T>(O2_in, static_cast<size_t>(n) * s);
+                O2_buf = O2_own.get();
             }
         }
 
@@ -320,11 +472,12 @@ private:
             // are left unwritten — same convention as the auto tier).
             fAfun = [&scalar_qfa, &A_op, &fscalar, d]
                     (int64_t m_, int64_t s_, const T *B, T *Y) {
-                T* qv = new T[s_];
-                scalar_qfa.call(A_op, B, m_, s_, fscalar, d, qv);
+                // unique_ptr: an exception out of scalar_qfa.call must not
+                // leak the per-call buffer.
+                std::unique_ptr<T[]> qv(new T[s_]);
+                scalar_qfa.call(A_op, B, m_, s_, fscalar, d, qv.get());
                 for (int64_t jj = 0; jj < s_; ++jj)
                     Y[jj + jj * s_] = qv[jj];
-                delete[] qv;
             };
         } else if (lfa_type == "block_qfa") {
             // Y is the s×s matrix M = Ω₂ᵀ f(A) Ω₂ (driver sizes fAOmega to s²).
@@ -360,10 +513,21 @@ private:
         // scalar_qfa: intrinsically no-reorth (basis-free recurrence); reorth /
         // adaptive_delay / adaptive_min do not apply — the Gauss-Radau
         // certificate has no window. adaptive_tol is its CERTIFIED tolerance.
+        // Any nonzero adaptive selects it (the scalar class has no window rule).
         scalar_qfa.adaptive      = (adaptive_fl != 0);
         scalar_qfa.adaptive_rtol = adaptive_tl;
+        // block_qfa adaptive semantics: 0 = fixed depth; 1 = Radau-certified
+        // (consistent with scalar_qfa's meaning); 2 = legacy window rule
+        // (honors adaptive_delay / adaptive_min). stop_rule and return_mode
+        // are assigned unconditionally: the oracle may be cached across calls
+        // (persistent-handle path), so every mode must be set by name, never
+        // inherited from a previous call.
         block_qfa.adaptive      = (adaptive_fl != 0);
         block_qfa.adaptive_rtol = adaptive_tl;
+        block_qfa.stop_rule     = (adaptive_fl == 2)
+            ? RandLAPACK::BlockQFAStop::Window : RandLAPACK::BlockQFAStop::Radau;
+        block_qfa.return_mode   = (radau_ret == 1)
+            ? RandLAPACK::BlockQFAReturn::Midpoint : RandLAPACK::BlockQFAReturn::Gauss;
         // Assign UNCONDITIONALLY, restoring the library default by name when the
         // caller passed 0. The former `if (x > 0)` form depended on the oracle
         // being freshly constructed every call to supply the default; once the
@@ -375,15 +539,30 @@ private:
             ? adaptive_dl : RandLAPACK::BlockLanczosQFA<T>::default_adaptive_delay;
         block_qfa.adaptive_min   = (adaptive_mn > 0)
             ? adaptive_mn : RandLAPACK::BlockLanczosQFA<T>::default_adaptive_min;
-        driver.vec_nnz    = vec_nnz;
-        driver.use_qfa    = qfa_mode;
+        driver.vec_nnz         = vec_nnz;
+        driver.use_qfa         = qfa_mode;
+        driver.auto_depth_cap  = auto_dcap;
+        driver.auto_probe_frac = static_cast<T>(auto_pfrac);
         T t1 = (T)0, t2 = (T)0;
         const T *Omega2_ptr = phase2_skipped ? nullptr : O2_buf;
         RandBLAS::RNGState<RNG> state(static_cast<uint32_t>(sketch_seed));
         T est;
         if (lfa_type == "auto") {
-            est = driver.call(A_op, fscalar, auto_budget, static_cast<T>(auto_eps),
-                              state, t1, t2);
+            // The auto overload throws std::invalid_argument for an infeasible
+            // matvec budget. Surface that as a dedicated MATLAB error id so
+            // the benchmark can catch it and write a skip row; other
+            // invalid_argument reasons (eps / probe_frac range) keep the
+            // generic StdError id.
+            try {
+                est = driver.call(A_op, fscalar, auto_budget, static_cast<T>(auto_eps),
+                                  state, t1, t2);
+            } catch (const std::invalid_argument& e) {
+                const std::string msg = e.what();
+                if (msg.find("infeasible") != std::string::npos) {
+                    raise("randlapack:fun_nystrom_pp:infeasibleBudget", msg);
+                }
+                raise("randlapack:fun_nystrom_pp_mex:StdError", msg);
+            }
         } else {
             est = driver.call(A_op, fAfun, fscalar,
                               k, s, q,
@@ -425,23 +604,43 @@ private:
             else if (lfa_type == "scalar_qfa") d_used = static_cast<double>(scalar_qfa.d_used);
             else if (lfa_type == "auto")       d_used = static_cast<double>(driver.auto_t);
             else                               d_used = static_cast<double>(d);
-            // Actual Phase-2 oracle matvecs (Σ per-probe certified depths) for
-            // the scalar-QFA-backed types; 0 otherwise (analytic s*d_used).
+            // Actual Phase-2 oracle matvecs: Σ per-probe certified depths for
+            // the scalar-QFA-backed types, s*d_used (the class's matvecs
+            // member) for block_qfa; 0 otherwise (analytic s*d_used).
             double oracle_mv = 0.0;
             if      (lfa_type == "scalar_qfa") oracle_mv = static_cast<double>(scalar_qfa.matvecs);
+            else if (lfa_type == "block_qfa")  oracle_mv = static_cast<double>(block_qfa.matvecs);
             else if (lfa_type == "auto")       oracle_mv = static_cast<double>(driver.auto_oracle_matvecs);
             // Knob-free bookkeeping (zeros unless lfa_type == 'auto'): the chosen
             // rank / probe count and the matvecs the depth probe actually spent.
             // With the certified oracle the budget closes as an upper bound:
-            // probe_mv + auto_k + oracle_mv <= budget.
+            // probe_mv + q*auto_k + oracle_mv <= budget (q = 1 in the auto tier).
             const bool is_auto = (lfa_type == "auto");
             const double auto_k_out  = is_auto ? static_cast<double>(driver.auto_k) : 0.0;
             const double auto_s_out  = is_auto ? static_cast<double>(driver.auto_s) : 0.0;
             const double probe_mv    = is_auto ? static_cast<double>(driver.auto_probe_matvecs) : 0.0;
+            // Path-specific fields, NaN when the path did not run (see the
+            // header comment): block_qfa's Gauss/Radau traces + certification,
+            // and the auto tier's probe wall-clock + certification flags.
+            const double nan_v = std::numeric_limits<double>::quiet_NaN();
+            double tr_U_out = nan_v, tr_L_out = nan_v, cert_out = nan_v;
+            if (lfa_type == "block_qfa") {
+                tr_U_out = static_cast<double>(block_qfa.tr_U);
+                tr_L_out = static_cast<double>(block_qfa.tr_L);
+                cert_out = block_qfa.certified ? 1.0 : 0.0;
+            }
+            double probe_ms_out = nan_v, probe_conv_out = nan_v, ph2_cert_out = nan_v;
+            if (is_auto) {
+                probe_ms_out   = driver.t_probe_ms;
+                probe_conv_out = driver.auto_probe_converged ? 1.0 : 0.0;
+                ph2_cert_out   = driver.auto_phase2_certified ? 1.0 : 0.0;
+            }
             matlab::data::StructArray ts = factory.createStructArray({1, 1},
                 {"marshal_in_ms", "phase1_ms", "phase2_ms", "fafun_ms",
                  "assembly_ms", "specrec_ms", "nystrom_us", "lfa_us", "d_used",
-                 "oracle_mv", "auto_k", "auto_s", "probe_mv"});
+                 "oracle_mv", "auto_k", "auto_s", "probe_mv",
+                 "tr_U", "tr_L", "certified",
+                 "probe_ms", "probe_converged", "phase2_certified"});
             ts[0]["marshal_in_ms"] = factory.createScalar<double>(marshal_in_ms);
             ts[0]["phase1_ms"]     = factory.createScalar<double>(driver.t_phase1_ms);
             ts[0]["phase2_ms"]     = factory.createScalar<double>(driver.t_phase2_ms);
@@ -457,11 +656,15 @@ private:
             ts[0]["auto_k"]        = factory.createScalar<double>(auto_k_out);
             ts[0]["auto_s"]        = factory.createScalar<double>(auto_s_out);
             ts[0]["probe_mv"]      = factory.createScalar<double>(probe_mv);
+            ts[0]["tr_U"]          = factory.createScalar<double>(tr_U_out);
+            ts[0]["tr_L"]          = factory.createScalar<double>(tr_L_out);
+            ts[0]["certified"]     = factory.createScalar<double>(cert_out);
+            ts[0]["probe_ms"]      = factory.createScalar<double>(probe_ms_out);
+            ts[0]["probe_converged"]  = factory.createScalar<double>(probe_conv_out);
+            ts[0]["phase2_certified"] = factory.createScalar<double>(ph2_cert_out);
             outputs[3] = std::move(ts);
         }
-
-        delete[] A_buf;
-        delete[] O2_buf;
+        // A_own / O2_own release their buffers here (RAII).
     }
 
 public:
@@ -469,12 +672,13 @@ public:
 
     void operator()(ArgumentList outputs, ArgumentList inputs) {
         try {
-            if (inputs.size() < 8 || inputs.size() > 18) {
+            if (inputs.size() < 8 || inputs.size() > 21) {
                 raise("randlapack:fun_nystrom_pp_mex:nargin",
-                      "Expected 8 to 18 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
+                      "Expected 8 to 21 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
                       "lfa_type, d [, sketch_type, vec_nnz, sketch_seed, reorth, "
                       "adaptive, adaptive_tol, adaptive_delay, adaptive_min, "
-                      "budget, auto_eps]");
+                      "budget, auto_eps, radau_return, auto_depth_cap, "
+                      "auto_probe_frac]");
             }
             if (outputs.size() < 1 || outputs.size() > 4) {
                 raise("randlapack:fun_nystrom_pp_mex:nargout",
@@ -534,23 +738,28 @@ public:
                 run_fun_nystrom<float>(outputs, inputs);
             }
         }
+        catch (const MexError& r) {
+            emit_matlab_error(r.id, r.msg);
+        }
         catch (const RandLAPACK::Error& e) {
-            raise("randlapack:fun_nystrom_pp_mex:RandLAPACKError", e.what());
+            emit_matlab_error("randlapack:fun_nystrom_pp_mex:RandLAPACKError", e.what());
         }
         catch (const RandBLAS::Error& e) {
-            raise("randlapack:fun_nystrom_pp_mex:RandBLASError", e.what());
+            emit_matlab_error("randlapack:fun_nystrom_pp_mex:RandBLASError", e.what());
         }
         catch (const matlab::Exception&) {
-            // MATLAB exceptions (typically from feval(error)) propagate unchanged
-            // so MATLAB sees the original error ID and message.
+            // Engine exceptions (e.g. an interrupt) propagate unchanged. NB in
+            // the dual-libstdc++ setup this clause may fail to match, in which
+            // case the std::exception clause below re-labels the error as
+            // StdError with the message preserved.
             throw;
         }
         catch (const std::exception& e) {
-            raise("randlapack:fun_nystrom_pp_mex:StdError", e.what());
+            emit_matlab_error("randlapack:fun_nystrom_pp_mex:StdError", e.what());
         }
         catch (...) {
-            raise("randlapack:fun_nystrom_pp_mex:Unknown",
-                  "Unknown exception in fun_nystrom_pp_mex");
+            emit_matlab_error("randlapack:fun_nystrom_pp_mex:Unknown",
+                              "Unknown exception in fun_nystrom_pp_mex");
         }
     }
 };
