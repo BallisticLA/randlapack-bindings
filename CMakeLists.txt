@@ -13,7 +13,37 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 # Primary: find_package against an installed RandLAPACK. The user is expected
 # to set -DRandLAPACK_DIR=/path/to/install/lib/cmake/RandLAPACK when invoking
 # cmake. CPM fallback is a future addition.
+#
+# RandLAPACK_DIR must be the directory holding RandLAPACKConfig.cmake, but a
+# common mistake is passing the RandNLA-project root or the install prefix
+# instead. Accept those by searching the known install layouts beneath the
+# given directory; anything else gets an actionable error instead of
+# find_package's generic one.
 # ---------------------------------------------------------------------------
+if(DEFINED RandLAPACK_DIR AND NOT EXISTS "${RandLAPACK_DIR}/RandLAPACKConfig.cmake")
+    file(GLOB _rl_configs
+         "${RandLAPACK_DIR}/lib/cmake/RandLAPACK/RandLAPACKConfig.cmake"
+         "${RandLAPACK_DIR}/lib64/cmake/RandLAPACK/RandLAPACKConfig.cmake"
+         "${RandLAPACK_DIR}/RandLAPACK-install/lib/cmake/RandLAPACK/RandLAPACKConfig.cmake"
+         "${RandLAPACK_DIR}/RandLAPACK-install/lib64/cmake/RandLAPACK/RandLAPACKConfig.cmake"
+         "${RandLAPACK_DIR}/install/RandLAPACK-install/lib/cmake/RandLAPACK/RandLAPACKConfig.cmake"
+         "${RandLAPACK_DIR}/install/RandLAPACK-install/lib64/cmake/RandLAPACK/RandLAPACKConfig.cmake")
+    if(_rl_configs)
+        list(GET _rl_configs 0 _rl_config)
+        get_filename_component(_rl_dir "${_rl_config}" DIRECTORY)
+        message(STATUS "RandLAPACK_DIR does not itself contain RandLAPACKConfig.cmake; "
+                       "using ${_rl_dir} found beneath it")
+        set(RandLAPACK_DIR "${_rl_dir}" CACHE PATH "Directory containing RandLAPACKConfig.cmake" FORCE)
+    else()
+        message(FATAL_ERROR
+            "RandLAPACK_DIR=${RandLAPACK_DIR} does not contain RandLAPACKConfig.cmake, "
+            "and none was found in the usual install layouts beneath it. "
+            "If RandLAPACK's install.sh has not completed successfully yet, run it first -- "
+            "it prints the exact -DRandLAPACK_DIR to use. Otherwise locate the file with\n"
+            "    find <project-dir>/install -name RandLAPACKConfig.cmake\n"
+            "and pass its directory.")
+    endif()
+endif()
 find_package(RandLAPACK REQUIRED)
 message(STATUS "RandLAPACK found at ${RandLAPACK_DIR}")
 
