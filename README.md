@@ -73,9 +73,9 @@ Run `help randlapack.bqrrp` for the full signature, including the optional `b_sz
 For matrix-function trace estimation:
 
 ```matlab
-A = gallery('randsvd', 1000);   % symmetric test matrix
-n = size(A, 1);
-est = randlapack.fun_nystrom_pp(A, randn(n, 100), randn(n, 50), 'Func', 'sqrt');
+n = 1000;
+G = randn(n, 200); A = G * G.' / 200;   % symmetric PSD test matrix
+est = randlapack.fun_nystrom_pp(A, 100, 50, 'Func', 'sqrt');   % k=100, s=50
 ```
 
 Run `help randlapack.fun_nystrom_pp` for the full name-value signature (`Func`, `Q`, `LFAType`, `Depth`, `Sketch`, `Reorth`, …).

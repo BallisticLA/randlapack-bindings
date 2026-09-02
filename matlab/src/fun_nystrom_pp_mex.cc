@@ -7,7 +7,7 @@
 //                                      sketch_type, vec_nnz, sketch_seed, reorth, ...
 //                                      adaptive, adaptive_tol, adaptive_delay, ...
 //                                      adaptive_min, budget, auto_eps, radau_return, ...
-//                                      auto_depth_cap, auto_probe_frac)
+//                                      auto_depth_cap, auto_probe_frac, adaptive_matvec_cap)
 //
 // where:
 //   A           n x n matrix, single or double, column-major. BOTH triangles are
@@ -26,7 +26,7 @@
 //                 effdim: f(x) = x/(x + poly_lambda)   ("effective dimension"; operator monotone)
 //   q           subspace-iter count (>= 1). q = 1 is single-pass Nystrom.
 //   poly_lambda lambda used by func 'poly' and 'effdim'
-//   lfa_type    'exact' | 'scalar' | 'scalar_qfa' | 'block' | 'block_qfa' | 'auto'
+//   lfa_type    'exact' | 'scalar' | 'scalar_qfa' | 'block' | 'block_qfa' | 'auto' | 'adaptive'
 //                 exact:  build f(A) once via syevd, every f(A)*X is a GEMM (validation oracle)
 //                 scalar: per-column scalar Lanczos-FA at depth d (= Lanczos quadrature per probe)
 //                 scalar_qfa: per-column scalar Lanczos-QFA — the per-probe
@@ -61,12 +61,28 @@
 //                         auto_probe_frac) tune the depth probe. An infeasible
 //                         budget raises MATLAB error id
 //                         'randlapack:fun_nystrom_pp:infeasibleBudget'.
+//                 adaptive: fully knob-free, EPS-TARGETED tier (no upfront
+//                         matvec budget). The driver picks k, s, and the
+//                         oracle depth t itself from a certified BLOCK
+//                         Gauss-Radau depth probe run at rtol = auto_eps
+//                         [input 18, reused as eps]; the positional
+//                         k/s/d/reorth/adaptive inputs are IGNORED. Input 20
+//                         (auto_depth_cap) caps the probe depth, shared with
+//                         the 'auto' tier. Input 22 (adaptive_matvec_cap, 0 =
+//                         no cap) optionally bounds the total matvec spend;
+//                         when it clamps the rank/probe split infeasibly
+//                         small, or when the eps/n regime cannot fund the
+//                         block-Krylov-coupled probe count (s*t <= n), the
+//                         driver throws and the MEX raises the SAME error id
+//                         as the 'auto' tier's infeasible budget:
+//                         'randlapack:fun_nystrom_pp:infeasibleBudget'.
 //   d           Lanczos depth (used for lfa_type in {scalar, scalar_qfa, block,
-//               block_qfa}; the adaptive QFA modes treat it as a depth CAP)
+//               block_qfa}; the adaptive QFA modes treat it as a depth CAP;
+//               ignored, like the positional k/s, for 'auto'/'adaptive')
 //   sketch_type IGNORED (accepted for call-site compatibility; the Phase-1
 //               sketch is always the kernel-internal SASO). A MATLAB warning is
 //               issued if anything other than 'saso' is passed explicitly.
-//   vec_nnz     nonzeros per column of the SASO sketch (default 8; 0 = auto,
+//   vec_nnz     nonzeros per ROW of the SASO sketch (default 8; 0 = auto,
 //               resolved to ~log(k) inside NystromEVD)   [optional, input 10]
 //   sketch_seed RNG seed for the Phase-1 sketch (default 42)        [optional, input 11]
 //   ...         optional inputs 12-18 (reorth, adaptive, adaptive_tol,
@@ -78,6 +94,9 @@
 //                   cap, the default)                   [optional, input 20]
 //   auto_probe_frac 'auto' tier: fraction of the matvec budget the depth
 //                   probe may spend, in (0, 1) (default 0.125) [optional, input 21]
+//   adaptive_matvec_cap  'adaptive' tier only: optional total matvec cap (0 =
+//                   no cap, the default). Ignored by every other lfa_type.
+//                                                       [optional, input 22]
 //
 // Outputs:
 //   est         trace estimate t1 + t2 (scalar double)
@@ -113,46 +132,69 @@
 //                                'block_qfa' + adaptive this is the online-chosen
 //                                depth (<= d cap); for 'scalar_qfa' + adaptive it
 //                                is the MAX per-probe certified depth; for 'auto'
-//                                it is the probe-discovered depth cap t; otherwise
-//                                it equals the fixed d.
+//                                it is the probe-discovered depth cap t; for
+//                                'adaptive' it is the depth probe's certified (or
+//                                reached) depth t (driver.adaptive_t); for 'exact'
+//                                it is NaN (no Lanczos recurrence runs; the fixed
+//                                d input is not a meaningful cost figure there);
+//                                otherwise (scalar/block/block_qfa fixed-depth) it
+//                                equals the fixed d.
 //                 oracle_mv      total A-matvecs the Phase-2 oracle actually
 //                                spent: Σ per-probe depths for 'scalar_qfa' and
-//                                'auto'; s*d_used for 'block_qfa' (the class's
-//                                matvecs member); 0 for 'exact'/'scalar'/'block'
-//                                (their count is the analytic s*d_used). The
-//                                benchmark should prefer this over d_used-based
-//                                re-costing.
-//                 auto_k         'auto' only: chosen Nystrom rank (else 0)
-//                 auto_s         'auto' only: chosen probe count (else 0)
-//                 probe_mv       'auto' only: matvecs the depth probe actually
-//                                spent (else 0). With the certified oracle the
-//                                budget closes as an upper bound:
+//                                'auto'; s*d_used for 'block_qfa'; the block
+//                                oracle's matvecs member for 'adaptive'
+//                                (driver.adaptive_oracle_matvecs); 0 for
+//                                'exact'/'scalar'/'block' (their count is the
+//                                analytic s*d_used). The benchmark should prefer
+//                                this over d_used-based re-costing.
+//                 auto_k         'auto'/'adaptive' only: chosen Nystrom rank
+//                                (driver.auto_k / driver.adaptive_k; else 0)
+//                 auto_s         'auto'/'adaptive' only: chosen probe count
+//                                (driver.auto_s / driver.adaptive_s; else 0)
+//                 probe_mv       'auto'/'adaptive' only: matvecs the depth probe
+//                                actually spent (else 0). With the certified
+//                                oracle the budget closes as an upper bound:
 //                                probe_mv + q*auto_k + oracle_mv <= budget
-//                                (Phase 1 costs q*auto_k matvecs, q=1 here).
+//                                (Phase 1 costs q*auto_k matvecs, q=1 here; the
+//                                'adaptive' tier has no upfront budget, so this
+//                                is an accounting identity, not a constraint).
 //
 //               New fields below use the NaN convention: NaN when the path
 //               that produces them did not run (instead of a fake 0, which
 //               would be indistinguishable from a real measurement).
-//                 tr_U           'block_qfa' only: final block Gauss trace of
-//                                Ω₂ᵀf(A)Ω₂ (upper side of the Radau bracket
-//                                when Adaptive = 1); NaN otherwise.
-//                 tr_L           'block_qfa' only: final block Gauss-Radau
-//                                trace (lower side; equals tr_U when no
-//                                certificate ran); NaN otherwise.
-//                 certified      'block_qfa' only: 1 if the Radau bracket
-//                                closed within adaptive_tol, 0 if not (fixed
-//                                depth, Window rule, or an uncertified run to
-//                                the cap); NaN otherwise.
-//                 probe_ms       'auto' only: wall-clock of the depth probe
-//                                (runs BEFORE phase1_ms's clock starts, so
-//                                phase1_ms + phase2_ms excludes it); NaN
+//                 tr_U           'block_qfa'/'adaptive' only: final block Gauss
+//                                trace of Ω₂ᵀf(A)Ω₂ (upper side of the Radau
+//                                bracket); for 'adaptive' this is
+//                                driver.adaptive_tr_U; NaN otherwise.
+//                 tr_L           'block_qfa'/'adaptive' only: final block
+//                                Gauss-Radau trace (lower side; equals tr_U when
+//                                no certificate ran); for 'adaptive' this is
+//                                driver.adaptive_tr_L; NaN otherwise.
+//                 certified      'block_qfa'/'adaptive'/'scalar_qfa' (with
+//                                Adaptive=1) only: 1 if the Radau bracket
+//                                closed within (adaptive_tol / auto_eps), 0 if
+//                                not; for 'adaptive' this is
+//                                driver.adaptive_phase2_certified; for
+//                                'scalar_qfa' this is scalar_qfa.all_certified
+//                                (every probe column certified before the
+//                                depth cap); NaN otherwise (including
+//                                'scalar_qfa' with Adaptive=0, where no
+//                                certificate was checked).
+//                 probe_ms       'auto'/'adaptive' only: wall-clock of the depth
+//                                probe (runs BEFORE phase1_ms's clock starts, so
+//                                phase1_ms + phase2_ms excludes it; 'adaptive'
+//                                reads driver.t_adaptive_probe_ms); NaN
 //                                otherwise.
-//                 probe_converged   'auto' only: 1 if every probe column
-//                                certified before the probe cap; NaN otherwise.
-//                 phase2_certified  'auto' only: 1 if every Phase-2 oracle
-//                                column certified at its depth cap (distinct
-//                                from probe_converged, which names ONLY the
-//                                probe); NaN otherwise.
+//                 probe_converged   'auto'/'adaptive' only: 1 if the depth probe
+//                                certified before the probe cap ('adaptive'
+//                                reads driver.adaptive_probe_certified); NaN
+//                                otherwise.
+//                 phase2_certified  'auto'/'adaptive' only: 1 if every Phase-2
+//                                oracle column/block certified at its depth cap
+//                                (distinct from probe_converged, which names
+//                                ONLY the probe; 'adaptive' reads
+//                                driver.adaptive_phase2_certified); NaN
+//                                otherwise.
 //
 // A may be single or double; the computation runs in that precision and the
 // scalar outputs are returned as double. Omega1/Omega2 must match the class
@@ -173,6 +215,7 @@
 #include <functional>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -346,6 +389,9 @@ private:
         // cap) and the fraction of the budget the probe may spend, in (0, 1).
         const int64_t     auto_dcap   = (inputs.size() >= 20) ? read_int(inputs[19], "auto_depth_cap") : 0;
         const double      auto_pfrac  = (inputs.size() >= 21) ? read_double(inputs[20], "auto_probe_frac") : 0.125;
+        // Eps-targeted tier (lfa_type == "adaptive") only: optional total
+        // matvec cap, 0 (default) => nullopt (no cap) at the driver call site.
+        const int64_t     adaptive_mvcap = (inputs.size() >= 22) ? read_int(inputs[21], "adaptive_matvec_cap") : 0;
 
         if (adaptive_fl < 0 || adaptive_fl > 2) {
             raise("randlapack:fun_nystrom_pp_mex:adaptive",
@@ -364,6 +410,10 @@ private:
             raise("randlapack:fun_nystrom_pp_mex:auto_probe_frac",
                   "auto_probe_frac (input 21) must lie in (0, 1)");
         }
+        if (adaptive_mvcap < 0) {
+            raise("randlapack:fun_nystrom_pp_mex:adaptive_matvec_cap",
+                  "adaptive_matvec_cap (input 22) must be >= 0 (0 = no cap)");
+        }
         if (vec_nnz < 0) {
             raise("randlapack:fun_nystrom_pp_mex:vec_nnz",
                   "vec_nnz (input 10) must be >= 0 (0 = auto, ~log(k))");
@@ -377,6 +427,18 @@ private:
                     "is always a kernel-internal SASO now.")
             });
         }
+
+        // Ignored-knob warnings for 'auto'/'adaptive' (q hardcoded to 1
+        // internally; Adaptive*/Depth/Reorth/RadauReturn all unread by
+        // these two tiers) used to live here as a value-comparison against
+        // the .m wrapper's own defaults -- which could not distinguish "the
+        // caller never touched this" from "the caller explicitly passed
+        // the default value", and fired on every call from a caller that
+        // always forwards a value verbatim (e.g. this repo's own MATLAB
+        // harness). Moved to randlapack.fun_nystrom_pp.m, which has access
+        // to inputParser's UsingDefaults and can tell the two apart; this
+        // low-level MEX entry point no longer warns on ignored knobs at all
+        // (matches its "low-level" framing in the header comment above).
 
         // --- Phase-1 sketch (input 2): scalar k. The sketch itself (SASO) is
         // generated inside NystromEVD from (sketch_seed, vec_nnz); explicit
@@ -392,7 +454,16 @@ private:
         int64_t s = 0;
         std::unique_ptr<T[]> O2_own;   // RAII: freed on every exit path
         T* O2_buf = nullptr;
-        if (!phase2_skipped) {
+        // 'auto'/'adaptive' never read Omega2/O2_buf: their driver.call
+        // overloads (below) don't even take an Omega2 argument, generating
+        // their own internal probes instead. Skip the marshal entirely for
+        // those two tiers, including the O(n*s) heap copy branch below,
+        // rather than paying a wasted copy of a caller-supplied explicit
+        // Omega2 (e.g. the "same probes for every estimator" comparison
+        // escape hatch) on every such call.
+        const bool skip_omega2_marshal =
+            (lfa_type == "auto" || lfa_type == "adaptive");
+        if (!phase2_skipped && !skip_omega2_marshal) {
             if (O2_in.getNumberOfElements() == 1) {
                 s = read_int(O2_in, "s");
                 if (s < 1) {
@@ -488,13 +559,25 @@ private:
         } else if (lfa_type == "auto") {
             // Knob-free tier: no oracle to build here; the driver's auto call
             // owns its QFA oracle and picks k/s/depth from (budget, auto_eps).
+            // Same id as randlapack.fun_nystrom_pp.m's own pre-check (unified:
+            // previously this used a different, undocumented
+            // 'randlapack:fun_nystrom_pp_mex:budget' id, unreachable through
+            // the documented .m API since .m always validates first; a direct
+            // fun_nystrom_pp_mex(...) call now raises the same id the .m
+            // wrapper would have).
             if (auto_budget < 1)
-                raise("randlapack:fun_nystrom_pp_mex:budget",
+                raise("randlapack:fun_nystrom_pp:Budget",
                       "lfa_type 'auto' requires a positive matvec budget (input 17)");
+        } else if (lfa_type == "adaptive") {
+            // Eps-targeted knob-free tier: no oracle to build here either; the
+            // driver's eps-targeted call owns its BLOCK QFA oracle and picks
+            // k/s/depth from a certified depth probe at rtol = auto_eps. No
+            // upfront budget is required (unlike 'auto'); adaptive_matvec_cap
+            // (0 = none) is passed straight through below.
         } else {
             raise("randlapack:fun_nystrom_pp_mex:lfa_type",
                   "unknown lfa_type '" + lfa_type +
-                  "' (use exact|scalar|scalar_qfa|block|block_qfa|auto)");
+                  "' (use exact|scalar|scalar_qfa|block|block_qfa|auto|adaptive)");
         }
 
         // --- drive funNystrom++ ---
@@ -507,6 +590,7 @@ private:
         block_lfa.timing  = true;
         block_qfa.timing  = true;
         driver.auto_sqfa.timing = true;
+        driver.adaptive_bqfa.timing = true;
         scalar_lfa.reorth = reorth_flag;
         block_lfa.reorth  = reorth_flag;
         block_qfa.reorth  = reorth_flag;
@@ -563,6 +647,32 @@ private:
                 }
                 raise("randlapack:fun_nystrom_pp_mex:StdError", msg);
             }
+        } else if (lfa_type == "adaptive") {
+            // Eps-targeted overload: auto_eps doubles as eps, auto_dcap (shared
+            // with the 'auto' tier's driver.auto_depth_cap member, already set
+            // above) bounds the probe depth. adaptive_mvcap == 0 => nullopt (no
+            // cap). The driver throws std::invalid_argument for two distinct
+            // infeasibility cases: the matvec_cap case and the block-Krylov
+            // s*t <= n case reachable at non-default probe block widths. Both
+            // driver messages contain "infeasible", so the OR-match above on
+            // "s*t <= n" is redundant-but-harmless; it is kept for robustness
+            // in case the driver message text changes. Both cases route to
+            // the SAME MATLAB error id as the 'auto' tier's infeasible-budget
+            // case, so callers can catch one id regardless of which
+            // knob-free tier they picked.
+            const std::optional<int64_t> mv_cap = (adaptive_mvcap > 0)
+                ? std::optional<int64_t>(adaptive_mvcap) : std::nullopt;
+            try {
+                est = driver.call(A_op, fscalar, static_cast<T>(auto_eps),
+                                  state, t1, t2, mv_cap);
+            } catch (const std::invalid_argument& e) {
+                const std::string msg = e.what();
+                if (msg.find("infeasible") != std::string::npos ||
+                    msg.find("s*t <= n") != std::string::npos) {
+                    raise("randlapack:fun_nystrom_pp:infeasibleBudget", msg);
+                }
+                raise("randlapack:fun_nystrom_pp_mex:StdError", msg);
+            }
         } else {
             est = driver.call(A_op, fAfun, fscalar,
                               k, s, q,
@@ -593,47 +703,84 @@ private:
                 lfa_us.assign(block_qfa.times.begin(), block_qfa.times.end());
             } else if (lfa_type == "auto" && driver.auto_sqfa.times.size() >= 5) {
                 lfa_us.assign(driver.auto_sqfa.times.begin(), driver.auto_sqfa.times.end());
+            } else if (lfa_type == "adaptive" && driver.adaptive_bqfa.times.size() >= 5) {
+                lfa_us.assign(driver.adaptive_bqfa.times.begin(), driver.adaptive_bqfa.times.end());
             }
+            // NaN convention (see the header comment): used below for both the
+            // path-specific fields and 'exact''s d_used (declared here, before
+            // its first use, rather than where the path-specific block below
+            // used to declare it).
+            const double nan_v = std::numeric_limits<double>::quiet_NaN();
             // Lanczos depth actually used by the f(A) oracle. For block_qfa with
             // adaptive stopping this is the online-chosen depth (< the d cap);
-            // for 'auto' it is the probe-discovered depth t; for every other
-            // lfa_type it is just the fixed d. Exposed so the benchmark can count
-            // matvecs (matvecs of A are proportional to this depth).
+            // for 'auto' it is the probe-discovered depth t; for 'adaptive' it is
+            // the depth probe's certified (or reached) depth t
+            // (driver.adaptive_t); for every other lfa_type it is just the fixed
+            // d, EXCEPT 'exact', which never runs a Lanczos recurrence at all (it
+            // builds f(A) once via syevd) and so has no meaningful depth: NaN,
+            // not the leftover default-depth input `d`, which would otherwise
+            // read as a real (if constant and meaningless) cost figure in a
+            // benchmark plot. Exposed so the benchmark can count matvecs
+            // (matvecs of A are proportional to this depth, for oracles that
+            // have one).
             double d_used;
             if      (lfa_type == "block_qfa")  d_used = static_cast<double>(block_qfa.d_used);
             else if (lfa_type == "scalar_qfa") d_used = static_cast<double>(scalar_qfa.d_used);
             else if (lfa_type == "auto")       d_used = static_cast<double>(driver.auto_t);
+            else if (lfa_type == "adaptive")   d_used = static_cast<double>(driver.adaptive_t);
+            else if (lfa_type == "exact")      d_used = nan_v;
             else                               d_used = static_cast<double>(d);
             // Actual Phase-2 oracle matvecs: Σ per-probe certified depths for
             // the scalar-QFA-backed types, s*d_used (the class's matvecs
-            // member) for block_qfa; 0 otherwise (analytic s*d_used).
+            // member) for block_qfa, the block oracle's matvecs member for
+            // 'adaptive'; 0 otherwise (analytic s*d_used).
             double oracle_mv = 0.0;
             if      (lfa_type == "scalar_qfa") oracle_mv = static_cast<double>(scalar_qfa.matvecs);
             else if (lfa_type == "block_qfa")  oracle_mv = static_cast<double>(block_qfa.matvecs);
             else if (lfa_type == "auto")       oracle_mv = static_cast<double>(driver.auto_oracle_matvecs);
-            // Knob-free bookkeeping (zeros unless lfa_type == 'auto'): the chosen
-            // rank / probe count and the matvecs the depth probe actually spent.
-            // With the certified oracle the budget closes as an upper bound:
-            // probe_mv + q*auto_k + oracle_mv <= budget (q = 1 in the auto tier).
-            const bool is_auto = (lfa_type == "auto");
-            const double auto_k_out  = is_auto ? static_cast<double>(driver.auto_k) : 0.0;
-            const double auto_s_out  = is_auto ? static_cast<double>(driver.auto_s) : 0.0;
-            const double probe_mv    = is_auto ? static_cast<double>(driver.auto_probe_matvecs) : 0.0;
+            else if (lfa_type == "adaptive")   oracle_mv = static_cast<double>(driver.adaptive_oracle_matvecs);
+            // Knob-free bookkeeping (zeros unless lfa_type == 'auto'/'adaptive'):
+            // the chosen rank / probe count and the matvecs the depth probe
+            // actually spent. With the certified oracle the budget closes as an
+            // upper bound: probe_mv + q*auto_k + oracle_mv <= budget (q = 1 in
+            // the auto tier; 'adaptive' has no upfront budget so this is an
+            // accounting identity, not a constraint enforced against an input).
+            const bool is_auto     = (lfa_type == "auto");
+            const bool is_adaptive = (lfa_type == "adaptive");
+            const double auto_k_out  = is_auto ? static_cast<double>(driver.auto_k)
+                                      : is_adaptive ? static_cast<double>(driver.adaptive_k) : 0.0;
+            const double auto_s_out  = is_auto ? static_cast<double>(driver.auto_s)
+                                      : is_adaptive ? static_cast<double>(driver.adaptive_s) : 0.0;
+            const double probe_mv    = is_auto ? static_cast<double>(driver.auto_probe_matvecs)
+                                      : is_adaptive ? static_cast<double>(driver.adaptive_probe_matvecs) : 0.0;
             // Path-specific fields, NaN when the path did not run (see the
-            // header comment): block_qfa's Gauss/Radau traces + certification,
-            // and the auto tier's probe wall-clock + certification flags.
-            const double nan_v = std::numeric_limits<double>::quiet_NaN();
+            // header comment): block_qfa's/adaptive's Gauss/Radau traces +
+            // certification, and the auto/adaptive tiers' probe wall-clock +
+            // certification flags. nan_v declared above, next to d_used.
             double tr_U_out = nan_v, tr_L_out = nan_v, cert_out = nan_v;
             if (lfa_type == "block_qfa") {
                 tr_U_out = static_cast<double>(block_qfa.tr_U);
                 tr_L_out = static_cast<double>(block_qfa.tr_L);
                 cert_out = block_qfa.certified ? 1.0 : 0.0;
+            } else if (is_adaptive) {
+                tr_U_out = static_cast<double>(driver.adaptive_tr_U);
+                tr_L_out = static_cast<double>(driver.adaptive_tr_L);
+                cert_out = driver.adaptive_phase2_certified ? 1.0 : 0.0;
+            } else if (lfa_type == "scalar_qfa" && scalar_qfa.adaptive) {
+                // NaN when Adaptive=0 (fixed depth): no certificate was ever
+                // checked, so all_certified's default-false would misreport
+                // "uncertified" rather than "not applicable".
+                cert_out = scalar_qfa.all_certified ? 1.0 : 0.0;
             }
             double probe_ms_out = nan_v, probe_conv_out = nan_v, ph2_cert_out = nan_v;
             if (is_auto) {
                 probe_ms_out   = driver.t_probe_ms;
                 probe_conv_out = driver.auto_probe_converged ? 1.0 : 0.0;
                 ph2_cert_out   = driver.auto_phase2_certified ? 1.0 : 0.0;
+            } else if (is_adaptive) {
+                probe_ms_out   = driver.t_adaptive_probe_ms;
+                probe_conv_out = driver.adaptive_probe_certified ? 1.0 : 0.0;
+                ph2_cert_out   = driver.adaptive_phase2_certified ? 1.0 : 0.0;
             }
             matlab::data::StructArray ts = factory.createStructArray({1, 1},
                 {"marshal_in_ms", "phase1_ms", "phase2_ms", "fafun_ms",
@@ -672,13 +819,13 @@ public:
 
     void operator()(ArgumentList outputs, ArgumentList inputs) {
         try {
-            if (inputs.size() < 8 || inputs.size() > 21) {
+            if (inputs.size() < 8 || inputs.size() > 22) {
                 raise("randlapack:fun_nystrom_pp_mex:nargin",
-                      "Expected 8 to 21 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
+                      "Expected 8 to 22 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
                       "lfa_type, d [, sketch_type, vec_nnz, sketch_seed, reorth, "
                       "adaptive, adaptive_tol, adaptive_delay, adaptive_min, "
                       "budget, auto_eps, radau_return, auto_depth_cap, "
-                      "auto_probe_frac]");
+                      "auto_probe_frac, adaptive_matvec_cap]");
             }
             if (outputs.size() < 1 || outputs.size() > 4) {
                 raise("randlapack:fun_nystrom_pp_mex:nargout",
