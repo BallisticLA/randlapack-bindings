@@ -460,6 +460,71 @@ function test_fun_nystrom_pp()
         assert(strcmp(got_id, 'MATLAB:InputParser:ArgumentFailedValidation'), ...
                '[%s] Reorth=-3 raised ''%s'', expected ArgumentFailedValidation', cls, got_id);
 
+        % --- 17. Vector-as-diagonal mode: passing the n diagonal entries as a
+        %         vector is the same computation as passing the dense
+        %         diag(lambda), at the same seed, for every LFAType. The point
+        %         is large n, where the dense matrix does not fit; correctness
+        %         is checked here at the fixture size. ---
+        lam_d = cast(lam, cls);
+        A_diag = diag(lam_d);
+        vec_tol = strcmp(cls, 'single') * 1e-4 + strcmp(cls, 'double') * 1e-10;
+        for it = 1:numel(lfa_types)
+            lfa = lfa_types{it};
+            if strcmp(lfa, 'auto')
+                extra = {'Budget', budget, 'AutoEps', 1e-2};
+            elseif depth_for.(lfa) > 0
+                extra = {'Q', 1, 'Depth', depth_for.(lfa)};
+            else
+                extra = {'Q', 1};
+            end
+            est_dense = randlapack.fun_nystrom_pp(A_diag, k, s, 'Func', 'sqrt', ...
+                'LFAType', lfa, 'SketchSeed', 11, 'SkipSymCheck', true, extra{:});
+            est_vec = randlapack.fun_nystrom_pp(lam_d, k, s, 'Func', 'sqrt', ...
+                'LFAType', lfa, 'SketchSeed', 11, extra{:});
+            assert(isfinite(est_vec), '[%s/%s] vector-mode estimate is not finite', cls, lfa);
+            assert(abs(est_vec - est_dense) <= vec_tol * abs(est_dense), ...
+                   '[%s/%s] vector mode %.12e differs from dense diag %.12e', ...
+                   cls, lfa, est_vec, est_dense);
+        end
+
+        % Row-vector orientation is accepted and gives the same answer.
+        est_row = randlapack.fun_nystrom_pp(lam_d.', k, s, 'Func', 'sqrt', ...
+            'Q', 1, 'LFAType', 'scalar_qfa', 'Depth', 60, 'SketchSeed', 11);
+        est_col = randlapack.fun_nystrom_pp(lam_d, k, s, 'Func', 'sqrt', ...
+            'Q', 1, 'LFAType', 'scalar_qfa', 'Depth', 60, 'SketchSeed', 11);
+        assert(abs(est_row - est_col) <= vec_tol * abs(est_col), ...
+               '[%s] row-vector A gave %.12e, column vector gave %.12e', cls, est_row, est_col);
+
+        % The eps-targeted tier runs in vector mode (its Rademacher probes are
+        % switched to sphere there, since a +-1 quadratic form is exact on a
+        % diagonal matrix) and produces a genuinely sampled, nonzero error.
+        est_ad = randlapack.fun_nystrom_pp(lam_d, k, s, 'Func', 'sqrt', ...
+            'LFAType', 'adaptive', 'AutoEps', 1e-2, 'SketchSeed', 11);
+        rel_ad = abs(est_ad - true_sqrt) / true_sqrt;
+        assert(isfinite(est_ad) && rel_ad < 5e-2, ...
+               '[%s] adaptive vector-mode rel_err = %.2e exceeds 5e-2', cls, rel_ad);
+        assert(rel_ad > 0, '[%s] adaptive vector-mode error is exactly zero', cls);
+
+        % Marshal cost is O(n), not O(n^2): a 50,000-entry diagonal marshals in
+        % milliseconds, where the dense matrix would be 20 GB.
+        lam_big = cast(logspace(0, -3, 50000)', cls);
+        [~, ~, ~, times_big] = randlapack.fun_nystrom_pp(lam_big, 8, 4, ...
+            'Func', 'sqrt', 'Q', 1, 'LFAType', 'scalar_qfa', 'Depth', 4, 'SketchSeed', 11);
+        assert(times_big.marshal_in_ms < 100, ...
+               '[%s] n = 50000 vector marshal took %.1f ms, expected under 100 ms', ...
+               cls, times_big.marshal_in_ms);
+
+        % Bad shapes are rejected with the documented id.
+        got_id = '';
+        try
+            randlapack.fun_nystrom_pp(cast(ones(3, 4), cls), 2, 2, 'Func', 'sqrt', ...
+                'Q', 1, 'LFAType', 'exact');
+        catch err
+            got_id = err.identifier;
+        end
+        assert(strcmp(got_id, 'randlapack:fun_nystrom_pp:A_shape'), ...
+               '[%s] 3 x 4 A raised ''%s'', expected A_shape', cls, got_id);
+
         fprintf('test_fun_nystrom_pp [%6s]: OK\n', cls);
     end
 end

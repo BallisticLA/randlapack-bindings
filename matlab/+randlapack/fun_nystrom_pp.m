@@ -28,6 +28,15 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %            failure; pass 'SkipSymCheck', true to skip the O(n^2) check for
 %            callers who already know A is symmetric (e.g. a large-matrix
 %            benchmark loop).
+%
+%            VECTOR MODE: A may instead be an n-vector (either orientation),
+%            read as the diagonal entries of A = diag(A). The n x n matrix is
+%            never formed, in MATLAB or in the MEX, so this is the way to run
+%            at sizes where the dense matrix does not fit. The symmetry check
+%            is bypassed (there is no lower triangle), and LFAType 'adaptive'
+%            switches its Rademacher probes to the sphere, because a +-1
+%            quadratic form is exact on a diagonal matrix and would make that
+%            tier's error degenerate rather than sampled.
 %   k        Phase-1 rank (SCALAR). The Phase-1 sketch is a SparseStack/SASO
 %            generated INSIDE RandLAPACK::NystromEVD from (SketchSeed, VecNnz),
 %            matching the paper's Algorithm 1 line 1. Explicit Omega1 matrices
@@ -165,11 +174,25 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %   to the Persson MATLAB reference (which draws its own Gaussian sketch).
 
     % --- Required-argument validation (friendly MATLAB-side errors) ---
+    % A is either a square n x n matrix or an n-vector read as diag(A). The
+    % 'square' attribute would reject the vector, so the shape is checked here
+    % instead; 'numel' is the only safe size read (size(A,1) is 1 for a row
+    % vector).
     validateattributes(A, {'single', 'double'}, ...
-                       {'2d', 'square', 'real', 'finite', 'nonsparse'}, ...
+                       {'2d', 'real', 'finite', 'nonsparse'}, ...
                        mfilename, 'A', 1);
+    vector_mode = isvector(A) && ~isscalar(A);
+    if ~vector_mode && size(A, 1) ~= size(A, 2)
+        error('randlapack:fun_nystrom_pp:A_shape', ...
+              ['A must be a square n x n matrix or an n-vector of diagonal ' ...
+               'entries; got %d x %d.'], size(A, 1), size(A, 2));
+    end
     cls = class(A);
-    n   = size(A, 1);
+    if vector_mode
+        n = numel(A);
+    else
+        n = size(A, 1);
+    end
 
     if ~isscalar(k)
         error('randlapack:fun_nystrom_pp:Omega1Explicit', ...
@@ -343,7 +366,10 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     % direct fun_nystrom_pp_mex(...) call remains a raw low-level entry point
     % (matches the header comment's "low-level" framing) while every call
     % through this wrapper is protected by default. ---
-    if ~skip_sym_check
+    % Vector mode has no lower triangle to discard, and A - A.' would broadcast
+    % an n x 1 vector into an n x n array (20 GB at n = 50,000), so the check is
+    % bypassed outright there rather than through SkipSymCheck.
+    if ~skip_sym_check && ~vector_mode
         A_diff = A - A.';
         asym   = max(abs(A_diff(:)));
         ascale = max(abs(A(:)));

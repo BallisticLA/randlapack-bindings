@@ -348,11 +348,19 @@ private:
         const auto t_marshal_start = std::chrono::steady_clock::now();
         using RNG = r123::Philox4x32;
 
-        // A: n x n (RAII-owned; freed on every exit path, including raise()
-        // and exceptions out of driver.call)
+        // A: n x n, or an n-vector holding diag(A) (RAII-owned; freed on every
+        // exit path, including raise() and exceptions out of driver.call).
+        // Vector mode copies n values, not n^2, and skips the triangle mirror
+        // below; the shape was validated in operator().
         const Array& A_in = inputs[0];
-        const int64_t n = static_cast<int64_t>(A_in.getDimensions()[0]);
-        std::unique_ptr<T[]> A_own = copy_into<T>(A_in, static_cast<size_t>(n) * n);
+        const auto A_dims = A_in.getDimensions();
+        const bool vector_mode = (A_dims.size() == 2) &&
+            ((A_dims[0] == 1 && A_dims[1] > 1) || (A_dims[1] == 1 && A_dims[0] > 1));
+        const int64_t n = vector_mode
+            ? static_cast<int64_t>(A_in.getNumberOfElements())
+            : static_cast<int64_t>(A_dims[0]);
+        std::unique_ptr<T[]> A_own = copy_into<T>(
+            A_in, vector_mode ? static_cast<size_t>(n) : static_cast<size_t>(n) * n);
         T* A_buf = A_own.get();
 
         // scalar params (read before sketch handling: internal sampling needs them)
@@ -486,12 +494,14 @@ private:
             }
         }
 
-        // Mirror upper triangle into lower unconditionally: the kernel's sparse
-        // first A-application goes through right_spmm, which reads A as generic
-        // dense (symmetry not exploited).
-        for (int64_t j = 0; j < n; ++j)
-            for (int64_t i = j + 1; i < n; ++i)
-                A_buf[i + j * n] = A_buf[j + i * n];
+        // Mirror upper triangle into lower: the kernel's sparse first
+        // A-application goes through right_spmm, which reads A as generic dense
+        // (symmetry not exploited). Vector mode has no triangles to mirror.
+        if (!vector_mode) {
+            for (int64_t j = 0; j < n; ++j)
+                for (int64_t i = j + 1; i < n; ++i)
+                    A_buf[i + j * n] = A_buf[j + i * n];
+        }
 
         const double marshal_in_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_marshal_start).count();
@@ -510,10 +520,7 @@ private:
         }
 
         // --- f(A)*X oracle ---
-        linops::ExplicitSymLinOp<T> A_op(n, blas::Uplo::Upper, A_buf, n, Layout::ColMajor);
-
         using FAFun = std::function<void(int64_t, int64_t, const T*, T*)>;
-        FAFun fAfun;
         RandLAPACK::LanczosFA<T>       scalar_lfa;
         RandLAPACK::LanczosQFA<T>      scalar_qfa;
         RandLAPACK::BlockLanczosFA<T>  block_lfa;
@@ -523,10 +530,87 @@ private:
         // Signalled to the driver below.
         const bool qfa_mode = (lfa_type == "block_qfa" || lfa_type == "scalar_qfa");
 
+        // --- drive funNystrom++ ---
+        // The driver and the four oracle objects are operator-independent and
+        // are read after the tier body (the timing outputs below), so they are
+        // declared here and the tier body is a generic lambda over the operator
+        // type: one implementation serves the dense and the diagonal operator.
+        RandLAPACK::FunNystromPP<T> driver;
+        // Sub-timers always on: a handful of steady_clock reads per call,
+        // negligible next to any BLAS work; consumed by the 4th output.
+        driver.nystrom_ws.times_enabled = true;
+        scalar_lfa.timing = true;
+        scalar_qfa.timing = true;
+        block_lfa.timing  = true;
+        block_qfa.timing  = true;
+        driver.auto_sqfa.timing = true;
+        driver.adaptive_bqfa.timing = true;
+        scalar_lfa.reorth = reorth_flag;
+        block_lfa.reorth  = reorth_flag;
+        block_qfa.reorth  = reorth_flag;
+        // scalar_qfa: intrinsically no-reorth (basis-free recurrence); reorth /
+        // adaptive_delay / adaptive_min do not apply: the Gauss-Radau
+        // certificate has no window. adaptive_tol is its CERTIFIED tolerance.
+        // Any nonzero adaptive selects it (the scalar class has no window rule).
+        scalar_qfa.adaptive      = (adaptive_fl != 0);
+        scalar_qfa.adaptive_rtol = adaptive_tl;
+        // block_qfa adaptive semantics: 0 = fixed depth; 1 = Radau-certified
+        // (consistent with scalar_qfa's meaning); 2 = legacy window rule
+        // (honors adaptive_delay / adaptive_min). stop_rule and return_mode
+        // are assigned unconditionally: the oracle may be cached across calls
+        // (persistent-handle path), so every mode must be set by name, never
+        // inherited from a previous call.
+        block_qfa.adaptive      = (adaptive_fl != 0);
+        block_qfa.adaptive_rtol = adaptive_tl;
+        block_qfa.stop_rule     = (adaptive_fl == 2)
+            ? RandLAPACK::BlockQFAStop::Window : RandLAPACK::BlockQFAStop::Radau;
+        block_qfa.return_mode   = (radau_ret == 1)
+            ? RandLAPACK::BlockQFAReturn::Midpoint : RandLAPACK::BlockQFAReturn::Gauss;
+        // Assign UNCONDITIONALLY, restoring the library default by name when the
+        // caller passed 0. The former `if (x > 0)` form depended on the oracle
+        // being freshly constructed every call to supply the default; once the
+        // oracle is cached (persistent-handle path) that assumption is false and
+        // the previous call's window leaks forward, changing d_used and hence
+        // both the estimate and the matvec count. The oracle is non-copyable and
+        // non-assignable, so "reset by reconstruction" is not available.
+        block_qfa.adaptive_delay = (adaptive_dl > 0)
+            ? adaptive_dl : RandLAPACK::BlockLanczosQFA<T>::default_adaptive_delay;
+        block_qfa.adaptive_min   = (adaptive_mn > 0)
+            ? adaptive_mn : RandLAPACK::BlockLanczosQFA<T>::default_adaptive_min;
+        driver.vec_nnz         = vec_nnz;
+        driver.use_qfa         = qfa_mode;
+        driver.auto_depth_cap  = auto_dcap;
+        driver.auto_probe_frac = static_cast<T>(auto_pfrac);
+        // A +-1 quadratic form is exact on a diagonal matrix, which would make
+        // the eps-targeted tier's error degenerate rather than sampled, so
+        // vector mode draws that tier's probes from the sphere instead.
+        driver.adaptive_rademacher = !vector_mode;
+
+        T t1 = (T)0, t2 = (T)0, est = (T)0;
+        const T *Omega2_ptr = phase2_skipped ? nullptr : O2_buf;
+        RandBLAS::RNGState<RNG> state(static_cast<uint32_t>(sketch_seed));
+        // f(lambda) for the vector-mode exact oracle; unused otherwise.
+        std::unique_ptr<T[]> flam_own;
+
+        auto drive_tiers = [&](auto& A_op) {
+        FAFun fAfun;
         if (lfa_type == "exact") {
-            // V*diag(f(lambda))*V^T*B via a one-shot syevd. Shared implementation
-            // with the RandLAPACK test + benchmark (single point of correctness).
-            fAfun = testing::make_exact_fa_oracle<T>(n, A_buf, fscalar);
+            if (vector_mode) {
+                // f(A)B is a row scaling by f(lambda). make_exact_fa_oracle's
+                // syevd needs the dense A and is not called here.
+                flam_own.reset(new T[n]);
+                for (int64_t i = 0; i < n; ++i) flam_own[i] = fscalar(A_buf[i]);
+                fAfun = [flam = flam_own.get()]
+                        (int64_t m_, int64_t s_, const T *B, T *Y) {
+                    for (int64_t jj = 0; jj < s_; ++jj)
+                        for (int64_t ii = 0; ii < m_; ++ii)
+                            Y[ii + jj * m_] = flam[ii] * B[ii + jj * m_];
+                };
+            } else {
+                // V*diag(f(lambda))*V^T*B via a one-shot syevd. Shared implementation
+                // with the RandLAPACK test + benchmark (single point of correctness).
+                fAfun = testing::make_exact_fa_oracle<T>(n, A_buf, fscalar);
+            }
         } else if (lfa_type == "scalar") {
             fAfun = [&scalar_lfa, &A_op, &fscalar, d]
                     (int64_t m_, int64_t s_, const T *B, T *Y) {
@@ -580,57 +664,6 @@ private:
                   "' (use exact|scalar|scalar_qfa|block|block_qfa|auto|adaptive)");
         }
 
-        // --- drive funNystrom++ ---
-        RandLAPACK::FunNystromPP<T> driver;
-        // Sub-timers always on: a handful of steady_clock reads per call,
-        // negligible next to any BLAS work; consumed by the 4th output.
-        driver.nystrom_ws.times_enabled = true;
-        scalar_lfa.timing = true;
-        scalar_qfa.timing = true;
-        block_lfa.timing  = true;
-        block_qfa.timing  = true;
-        driver.auto_sqfa.timing = true;
-        driver.adaptive_bqfa.timing = true;
-        scalar_lfa.reorth = reorth_flag;
-        block_lfa.reorth  = reorth_flag;
-        block_qfa.reorth  = reorth_flag;
-        // scalar_qfa: intrinsically no-reorth (basis-free recurrence); reorth /
-        // adaptive_delay / adaptive_min do not apply — the Gauss-Radau
-        // certificate has no window. adaptive_tol is its CERTIFIED tolerance.
-        // Any nonzero adaptive selects it (the scalar class has no window rule).
-        scalar_qfa.adaptive      = (adaptive_fl != 0);
-        scalar_qfa.adaptive_rtol = adaptive_tl;
-        // block_qfa adaptive semantics: 0 = fixed depth; 1 = Radau-certified
-        // (consistent with scalar_qfa's meaning); 2 = legacy window rule
-        // (honors adaptive_delay / adaptive_min). stop_rule and return_mode
-        // are assigned unconditionally: the oracle may be cached across calls
-        // (persistent-handle path), so every mode must be set by name, never
-        // inherited from a previous call.
-        block_qfa.adaptive      = (adaptive_fl != 0);
-        block_qfa.adaptive_rtol = adaptive_tl;
-        block_qfa.stop_rule     = (adaptive_fl == 2)
-            ? RandLAPACK::BlockQFAStop::Window : RandLAPACK::BlockQFAStop::Radau;
-        block_qfa.return_mode   = (radau_ret == 1)
-            ? RandLAPACK::BlockQFAReturn::Midpoint : RandLAPACK::BlockQFAReturn::Gauss;
-        // Assign UNCONDITIONALLY, restoring the library default by name when the
-        // caller passed 0. The former `if (x > 0)` form depended on the oracle
-        // being freshly constructed every call to supply the default; once the
-        // oracle is cached (persistent-handle path) that assumption is false and
-        // the previous call's window leaks forward, changing d_used and hence
-        // both the estimate and the matvec count. The oracle is non-copyable and
-        // non-assignable, so "reset by reconstruction" is not available.
-        block_qfa.adaptive_delay = (adaptive_dl > 0)
-            ? adaptive_dl : RandLAPACK::BlockLanczosQFA<T>::default_adaptive_delay;
-        block_qfa.adaptive_min   = (adaptive_mn > 0)
-            ? adaptive_mn : RandLAPACK::BlockLanczosQFA<T>::default_adaptive_min;
-        driver.vec_nnz         = vec_nnz;
-        driver.use_qfa         = qfa_mode;
-        driver.auto_depth_cap  = auto_dcap;
-        driver.auto_probe_frac = static_cast<T>(auto_pfrac);
-        T t1 = (T)0, t2 = (T)0;
-        const T *Omega2_ptr = phase2_skipped ? nullptr : O2_buf;
-        RandBLAS::RNGState<RNG> state(static_cast<uint32_t>(sketch_seed));
-        T est;
         if (lfa_type == "auto") {
             // The auto overload throws std::invalid_argument for an infeasible
             // matvec budget. Surface that as a dedicated MATLAB error id so
@@ -678,6 +711,15 @@ private:
                               k, s, q,
                               state, Omega2_ptr,
                               t1, t2);
+        }
+        };   // end drive_tiers
+
+        if (vector_mode) {
+            linops::DiagSymLinOp<T> A_op(n, A_buf);
+            drive_tiers(A_op);
+        } else {
+            linops::ExplicitSymLinOp<T> A_op(n, blas::Uplo::Upper, A_buf, n, Layout::ColMajor);
+            drive_tiers(A_op);
         }
 
         outputs[0] = factory.createScalar<double>(static_cast<double>(est));
@@ -832,19 +874,25 @@ public:
                       "Expected 1 to 4 outputs: [est, t1, t2, times]");
             }
 
-            // --- A: square, real, single/double ---
+            // --- A: square n x n, OR an n-vector read as diag(A), real,
+            // single/double. Vector mode never forms the n x n matrix. ---
             const Array& A_in = inputs[0];
             auto A_dims = A_in.getDimensions();
-            if (A_dims.size() != 2 || A_dims[0] != A_dims[1]) {
+            const bool vector_mode = (A_dims.size() == 2) &&
+                ((A_dims[0] == 1 && A_dims[1] > 1) || (A_dims[1] == 1 && A_dims[0] > 1));
+            if (A_dims.size() != 2 || (!vector_mode && A_dims[0] != A_dims[1])) {
                 raise("randlapack:fun_nystrom_pp_mex:A_shape",
-                      "A must be a square n x n matrix");
+                      "A must be a square n x n matrix or an n-vector of diagonal entries");
             }
             const ArrayType A_type = A_in.getType();
             if (A_type != ArrayType::DOUBLE && A_type != ArrayType::SINGLE) {
                 raise("randlapack:fun_nystrom_pp_mex:A_dtype",
                       "A must be single or double precision");
             }
-            const int64_t n = static_cast<int64_t>(A_dims[0]);
+            // A_dims[0] is 1 for a row vector, so numel is the only safe read.
+            const int64_t n = vector_mode
+                ? static_cast<int64_t>(A_in.getNumberOfElements())
+                : static_cast<int64_t>(A_dims[0]);
 
             // --- arg 2 (Phase-1): scalar k only. The Phase-1 sketch is a SASO
             // generated inside RandLAPACK::NystromEVD from (sketch_seed, vec_nnz);
