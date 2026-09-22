@@ -67,6 +67,11 @@ set_target_properties(fun_nystrom_pp_mex PROPERTIES
     RUNTIME_OUTPUT_DIRECTORY ${MEX_OUTPUT_DIR}
 )
 target_compile_features(fun_nystrom_pp_mex PRIVATE cxx_std_20)
+option(RANDLAPACK_BINDINGS_SYMMETRIC_SKETCH
+    "Use triangle-aware sketch products from a supporting RandBLAS installation" OFF)
+if(RANDLAPACK_BINDINGS_SYMMETRIC_SKETCH)
+    target_compile_definitions(fun_nystrom_pp_mex PRIVATE RANDLAPACK_SYMMETRIC_SKETCH=1)
+endif()
 target_link_options(fun_nystrom_pp_mex PRIVATE ${MEX_STATIC_LIBSTDCXX_FLAGS})
 if(COMMAND randlapack_stage_runtime_dlls)
     randlapack_stage_runtime_dlls(fun_nystrom_pp_mex)

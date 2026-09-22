@@ -10,11 +10,11 @@
 //                                      auto_depth_cap, auto_probe_frac, adaptive_matvec_cap)
 //
 // where:
-//   A           n x n matrix, single or double, column-major. BOTH triangles are
-//               used: the Phase-1 sketch application goes through sparse
-//               right_spmm, so the MEX mirrors upper->lower unconditionally.
+//   A           n x n matrix, single or double, column-major. Upper triangle
+//               defines the matrix; legacy builds mirror it for general sketch
+//               products, while symmetric-sketch builds read it directly.
 //   arg1        Phase-1 sketch SIZE: a SCALAR k (the rank). The sketch itself is
-//               a SparseStack/SASO generated INSIDE RandLAPACK::NystromEVD from
+//               a SASO sketch generated INSIDE RandLAPACK::NystromEVD from
 //               (sketch_seed, vec_nnz) — matching the paper's Algorithm 1 line 1.
 //               Passing an explicit matrix is an error (the dense-sketch mode was
 //               removed from the kernel).
@@ -128,7 +128,8 @@
 //                                reorth whenever reorth = 1) and 0 for
 //                                'scalar_qfa'/'auto' (basis-free recurrence,
 //                                no reorth by design).
-//                 d_used         Lanczos depth the oracle actually used. For
+//                 d_used         Actual depth for fixed/QFA modes; a selected
+//                                depth limit for automatic modes. For
 //                                'block_qfa' + adaptive this is the online-chosen
 //                                depth (<= d cap); for 'scalar_qfa' + adaptive it
 //                                is the MAX per-probe certified depth; for 'auto'
@@ -367,7 +368,19 @@ private:
         const std::string func        = read_string(inputs[3], "func");
         const int64_t     q           = read_int   (inputs[4], "q");
         const T           poly_lambda = static_cast<T>(read_double(inputs[5], "poly_lambda"));
-        const std::string lfa_type    = read_string(inputs[6], "lfa_type");
+        const std::string requested_lfa = read_string(inputs[6], "lfa_type");
+        const bool target_auto = (requested_lfa == "scalar_auto" || requested_lfa == "block_auto");
+        const std::string lfa_type = target_auto ? "adaptive" : requested_lfa;
+        // The Gauss / Radau-at-0 bracket needs the derivatives of f from order two up to
+        // alternate in sign, not f to be operator monotone. -x log x satisfies that with the
+        // same pattern as log(1+x): its nth derivative is (-1)^(n-1) (n-2)! / x^(n-1), so even
+        // orders are negative and odd orders positive. poly and square do not: x^2 has a second
+        // derivative of +2, the opposite sign, and the bracket does not hold for them.
+        if (target_auto && func != "sqrt" && func != "log" && func != "effdim"
+                        && func != "identity" && func != "entropy")
+            raise("randlapack:fun_nystrom_pp:unsupportedAutoFunction",
+                  "scalar_auto/block_auto support sqrt, log, effdim, identity and entropy; "
+                  "poly and square have no Radau certificate");
         const int64_t     d           = read_int   (inputs[7], "d");
         const std::string sketch_type = (inputs.size() >= 9)  ? read_string(inputs[8], "sketch_type") : "saso";
         const int64_t     vec_nnz     = (inputs.size() >= 10) ? read_int(inputs[9],  "vec_nnz")     : 8;
@@ -399,8 +412,27 @@ private:
         const double      auto_pfrac  = (inputs.size() >= 21) ? read_double(inputs[20], "auto_probe_frac") : 0.125;
         // Eps-targeted tier (lfa_type == "adaptive") only: optional total
         // matvec cap, 0 (default) => nullopt (no cap) at the driver call site.
-        const int64_t     adaptive_mvcap = (inputs.size() >= 22) ? read_int(inputs[21], "adaptive_matvec_cap") : 0;
+        const int64_t adaptive_mvcap = target_auto ? auto_budget
+            : ((inputs.size() >= 22) ? read_int(inputs[21], "adaptive_matvec_cap") : 0);
+        if (target_auto && auto_budget < 1)
+            raise("randlapack:fun_nystrom_pp:Budget", "scalar_auto/block_auto require a positive Budget");
+        // Eps-targeted tier only: the leading constants of the paper's split
+        // rule k = c_k sqrt(t)/eps, s = max(1, c_s/(sqrt(t) eps)). Both default
+        // to 1, the driver's own default, so an omitted argument reproduces the
+        // paper's unit-constant allocation exactly.
+        const double      adaptive_kc = (inputs.size() >= 23) ? read_double(inputs[22], "adaptive_k_const") : 1.0;
+        const double      adaptive_sc = (inputs.size() >= 24) ? read_double(inputs[23], "adaptive_s_const") : 1.0;
+        const double cap_rank_fraction = (inputs.size() >= 25) ? read_double(inputs[24], "cap_rank_fraction") : 1.0;
+        const double quadrature_fraction = (inputs.size() >= 26) ? read_double(inputs[25], "quadrature_fraction") : 1.0;
+        const double first_row_ql = (inputs.size() >= 27) ? read_double(inputs[26], "first_row_ql") : 0.0;
+        if (first_row_ql != 0.0 && first_row_ql != 1.0)
+            raise("randlapack:fun_nystrom_pp_mex:first_row_ql", "first_row_ql must be 0 or 1");
 
+        if (!std::isfinite(adaptive_kc) || !std::isfinite(adaptive_sc) ||
+            !(adaptive_kc > 0.0) || !(adaptive_sc > 0.0)) {
+            raise("randlapack:fun_nystrom_pp_mex:adaptive_split_const",
+                  "adaptive_k_const (input 23) and adaptive_s_const (input 24) must be > 0");
+        }
         if (adaptive_fl < 0 || adaptive_fl > 2) {
             raise("randlapack:fun_nystrom_pp_mex:adaptive",
                   "adaptive (input 13) must be 0 (fixed depth), 1 (Radau-certified), "
@@ -494,14 +526,14 @@ private:
             }
         }
 
-        // Mirror upper triangle into lower: the kernel's sparse first
-        // A-application goes through right_spmm, which reads A as generic dense
-        // (symmetry not exploited). Vector mode has no triangles to mirror.
+#ifndef RANDLAPACK_SYMMETRIC_SKETCH
+        // The legacy general sketch product requires both triangles.
         if (!vector_mode) {
             for (int64_t j = 0; j < n; ++j)
                 for (int64_t i = j + 1; i < n; ++i)
                     A_buf[i + j * n] = A_buf[j + i * n];
         }
+#endif
 
         const double marshal_in_ms = std::chrono::duration<double, std::milli>(
             std::chrono::steady_clock::now() - t_marshal_start).count();
@@ -514,9 +546,10 @@ private:
         else if (func == "effdim")   fscalar = [poly_lambda](T x) { return x / (x + poly_lambda); };
         else if (func == "square")   fscalar = [](T x) { return x * x; };
         else if (func == "identity") fscalar = [](T x) { return x; };
+        else if (func == "entropy")  fscalar = [](T x) { return x > (T)0 ? -x * std::log(x) : (T)0; };
         else {
             raise("randlapack:fun_nystrom_pp_mex:func",
-                  "unknown func '" + func + "' (use sqrt|log|poly|effdim|square|identity)");
+                  "unknown func '" + func + "' (use sqrt|log|poly|effdim|square|identity|entropy)");
         }
 
         // --- f(A)*X oracle ---
@@ -544,6 +577,8 @@ private:
         block_lfa.timing  = true;
         block_qfa.timing  = true;
         driver.auto_sqfa.timing = true;
+        scalar_qfa.use_first_row_ql = (first_row_ql != 0.0);
+        driver.auto_sqfa.use_first_row_ql = (first_row_ql != 0.0);
         driver.adaptive_bqfa.timing = true;
         scalar_lfa.reorth = reorth_flag;
         block_lfa.reorth  = reorth_flag;
@@ -584,7 +619,14 @@ private:
         // A +-1 quadratic form is exact on a diagonal matrix, which would make
         // the eps-targeted tier's error degenerate rather than sampled, so
         // vector mode draws that tier's probes from the sphere instead.
-        driver.adaptive_rademacher = !vector_mode;
+        driver.adaptive_rademacher = !target_auto && !vector_mode;
+        driver.adaptive_use_scalar = (requested_lfa == "scalar_auto");
+        driver.adaptive_reuse_pilot = !target_auto;
+        driver.adaptive_gauss_return = target_auto;
+        driver.adaptive_k_const    = static_cast<T>(adaptive_kc);
+        driver.adaptive_s_const    = static_cast<T>(adaptive_sc);
+        driver.adaptive_cap_rank_fraction = static_cast<T>(cap_rank_fraction);
+        driver.adaptive_quadrature_fraction = static_cast<T>(quadrature_fraction);
 
         T t1 = (T)0, t2 = (T)0, est = (T)0;
         const T *Omega2_ptr = phase2_skipped ? nullptr : O2_buf;
@@ -745,6 +787,8 @@ private:
                 lfa_us.assign(block_qfa.times.begin(), block_qfa.times.end());
             } else if (lfa_type == "auto" && driver.auto_sqfa.times.size() >= 5) {
                 lfa_us.assign(driver.auto_sqfa.times.begin(), driver.auto_sqfa.times.end());
+            } else if (requested_lfa == "scalar_auto" && driver.auto_sqfa.times.size() >= 5) {
+                lfa_us.assign(driver.auto_sqfa.times.begin(), driver.auto_sqfa.times.end());
             } else if (lfa_type == "adaptive" && driver.adaptive_bqfa.times.size() >= 5) {
                 lfa_us.assign(driver.adaptive_bqfa.times.begin(), driver.adaptive_bqfa.times.end());
             }
@@ -808,11 +852,34 @@ private:
                 tr_U_out = static_cast<double>(driver.adaptive_tr_U);
                 tr_L_out = static_cast<double>(driver.adaptive_tr_L);
                 cert_out = driver.adaptive_phase2_certified ? 1.0 : 0.0;
+                // scalar_auto: the driver's block traces are NaN by construction. The
+                // scalar oracle keeps per-column Gauss/Radau values for its last call,
+                // which is the Phase-2 call over driver.adaptive_s columns; report
+                // their sums so the bracket is available for every self-tuning tier.
+                if (driver.adaptive_use_scalar && driver.adaptive_s > 0 &&
+                    driver.auto_sqfa.gauss_val_sz >= driver.adaptive_s) {
+                    double su = 0.0, sl = 0.0;
+                    for (int64_t j = 0; j < driver.adaptive_s; ++j) {
+                        su += static_cast<double>(driver.auto_sqfa.gauss_val[j]);
+                        sl += static_cast<double>(driver.auto_sqfa.radau_val[j]);
+                    }
+                    tr_U_out = su; tr_L_out = sl;
+                }
             } else if (lfa_type == "scalar_qfa" && scalar_qfa.adaptive) {
                 // NaN when Adaptive=0 (fixed depth): no certificate was ever
                 // checked, so all_certified's default-false would misreport
                 // "uncertified" rather than "not applicable".
                 cert_out = scalar_qfa.all_certified ? 1.0 : 0.0;
+                // Sum of the per-column Gauss and Gauss-Radau values over the s
+                // Phase-2 columns: the scalar analogue of the block tier's tr_U/tr_L.
+                if (s > 0 && scalar_qfa.gauss_val_sz >= s) {
+                    double su = 0.0, sl = 0.0;
+                    for (int64_t j = 0; j < s; ++j) {
+                        su += static_cast<double>(scalar_qfa.gauss_val[j]);
+                        sl += static_cast<double>(scalar_qfa.radau_val[j]);
+                    }
+                    tr_U_out = su; tr_L_out = sl;
+                }
             }
             double probe_ms_out = nan_v, probe_conv_out = nan_v, ph2_cert_out = nan_v;
             if (is_auto) {
@@ -829,7 +896,10 @@ private:
                  "assembly_ms", "specrec_ms", "nystrom_us", "lfa_us", "d_used",
                  "oracle_mv", "auto_k", "auto_s", "probe_mv",
                  "tr_U", "tr_L", "certified",
-                 "probe_ms", "probe_converged", "phase2_certified"});
+                 "probe_ms", "probe_converged", "phase2_certified",
+                 "first_row_ql_requested", "first_row_ql_fallback", "symmetric_sketch",
+                 "ritz_clamped", "rank_deficient_steps", "min_diag_ratio",
+                 "nystrom_clamped", "bracket_evaluated"});
             ts[0]["marshal_in_ms"] = factory.createScalar<double>(marshal_in_ms);
             ts[0]["phase1_ms"]     = factory.createScalar<double>(driver.t_phase1_ms);
             ts[0]["phase2_ms"]     = factory.createScalar<double>(driver.t_phase2_ms);
@@ -851,6 +921,40 @@ private:
             ts[0]["probe_ms"]      = factory.createScalar<double>(probe_ms_out);
             ts[0]["probe_converged"]  = factory.createScalar<double>(probe_conv_out);
             ts[0]["phase2_certified"] = factory.createScalar<double>(ph2_cert_out);
+            ts[0]["first_row_ql_requested"] = factory.createScalar<bool>(first_row_ql != 0.0);
+            ts[0]["first_row_ql_fallback"] = factory.createScalar<bool>(
+                scalar_qfa.first_row_ql_fallback_seen || driver.auto_sqfa.first_row_ql_fallback_seen);
+#ifdef RANDLAPACK_SYMMETRIC_SKETCH
+            ts[0]["symmetric_sketch"] = factory.createScalar<bool>(true);
+#else
+            ts[0]["symmetric_sketch"] = factory.createScalar<bool>(false);
+#endif
+            // ---- Numerical-degradation diagnostics ----
+            // Until now the kernel's guards were unobservable: a clamped Ritz value, a
+            // rank-deficient block QR or a clamped Nystrom eigenvalue left no trace in any
+            // exported field, so a degraded run and a healthy one produced identical telemetry.
+            // These five fields are the channel out. Exactly one code path runs per call, so
+            // summing across the objects reports that path's totals and leaves the rest at zero.
+            const double ritz_clamped_total =
+                  (double)scalar_qfa.ritz_clamped
+                + (double)block_qfa.ritz_clamped + (double)block_qfa.fa.ritz_clamped
+                + (double)driver.auto_sqfa.ritz_clamped
+                + (double)driver.adaptive_bqfa.ritz_clamped
+                + (double)driver.adaptive_bqfa.fa.ritz_clamped;
+            const double rank_def_total =
+                  (double)block_qfa.fa.rank_deficient_steps
+                + (double)driver.adaptive_bqfa.fa.rank_deficient_steps;
+            // Smallest diag ratio seen by whichever block QR ran; stays Inf when none did, so a
+            // reader can tell "no block QR" from "a block QR that was comfortably full rank".
+            double min_ratio = (double)block_qfa.fa.min_diag_ratio;
+            if ((double)driver.adaptive_bqfa.fa.min_diag_ratio < min_ratio)
+                min_ratio = (double)driver.adaptive_bqfa.fa.min_diag_ratio;
+            ts[0]["ritz_clamped"]         = factory.createScalar<double>(ritz_clamped_total);
+            ts[0]["rank_deficient_steps"] = factory.createScalar<double>(rank_def_total);
+            ts[0]["min_diag_ratio"]       = factory.createScalar<double>(min_ratio);
+            ts[0]["nystrom_clamped"]      = factory.createScalar<double>((double)driver.nystrom_ws.clamped_eigenvalues);
+            ts[0]["bracket_evaluated"]    = factory.createScalar<bool>(
+                block_qfa.bracket_evaluated || driver.adaptive_bqfa.bracket_evaluated);
             outputs[3] = std::move(ts);
         }
         // A_own / O2_own release their buffers here (RAII).
@@ -861,13 +965,14 @@ public:
 
     void operator()(ArgumentList outputs, ArgumentList inputs) {
         try {
-            if (inputs.size() < 8 || inputs.size() > 22) {
+            if (inputs.size() < 8 || inputs.size() > 27) {
                 raise("randlapack:fun_nystrom_pp_mex:nargin",
-                      "Expected 8 to 22 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
+                      "Expected 8 to 27 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
                       "lfa_type, d [, sketch_type, vec_nnz, sketch_seed, reorth, "
                       "adaptive, adaptive_tol, adaptive_delay, adaptive_min, "
                       "budget, auto_eps, radau_return, auto_depth_cap, "
-                      "auto_probe_frac, adaptive_matvec_cap]");
+                      "auto_probe_frac, adaptive_matvec_cap, adaptive_k_const, "
+                      "adaptive_s_const, cap_rank_fraction, quadrature_fraction, first_row_ql]");
             }
             if (outputs.size() < 1 || outputs.size() > 4) {
                 raise("randlapack:fun_nystrom_pp_mex:nargout",
@@ -902,7 +1007,7 @@ public:
             if (O1_in.getNumberOfElements() != 1) {
                 raise("randlapack:fun_nystrom_pp_mex:Omega1_explicit",
                       "arg 2 must be a scalar k. Explicit Omega1 matrices are no "
-                      "longer supported: the Phase-1 sketch is a SparseStack/SASO "
+                      "longer supported: the Phase-1 sketch is a SASO "
                       "generated inside RandLAPACK (control it via sketch_seed and "
                       "vec_nnz).");
             }

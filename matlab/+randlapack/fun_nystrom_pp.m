@@ -1,5 +1,10 @@
 function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %FUN_NYSTROM_PP  Trace estimator tr(f(A)) via RandLAPACK FunNystromPP.
+%   Preferred four-method interface: randlapack.trace_estimate.
+%   LFAType scalar_auto/block_auto share target AutoEps and hard Budget,
+%   including the pilot. Both use sphere probes, independent pilot samples,
+%   the same rank/probe allocation, and Gauss output. Certification flags
+%   concern quadrature only, never the total stochastic trace error.
 %
 %   est = randlapack.fun_nystrom_pp(A, k, s, ...)
 %   est = randlapack.fun_nystrom_pp(A, k, Omega2, ...)   % explicit Phase-2 probes
@@ -16,8 +21,18 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %       that are NaN when their path did not run: tr_U, tr_L, certified
 %       ('block_qfa'/'adaptive' Gauss/Radau traces + bracket flag) and
 %       probe_ms, probe_converged, phase2_certified ('auto'/'adaptive'
-%       depth-probe wall-clock + certification flags). See
-%       fun_nystrom_pp_mex.cc for the full slot definitions.
+%       depth-probe wall-clock + certification flags), and five numerical-
+%       degradation diagnostics that are always populated for a compiled
+%       call: ritz_clamped (negative Ritz values clamped to zero before f,
+%       summed over every Lanczos object the call used), rank_deficient_steps
+%       and min_diag_ratio (block QR steps whose smallest |diag R| fell below
+%       16 eps times the largest, and the smallest such ratio seen; Inf when
+%       no block QR ran), nystrom_clamped (head eigenvalues driven negative
+%       by the shift removal and clamped), and bracket_evaluated (true only
+%       when a Gauss/Gauss-Radau pair was actually computed; when false,
+%       tr_U == tr_L carries no information). All are cumulative over the
+%       call and nothing branches on them. See fun_nystrom_pp_mex.cc for the
+%       full slot definitions.
 %
 %   A        n x n matrix, single or double, REQUIRED symmetric. The MEX
 %            reads only the upper triangle and mirrors it into the lower
@@ -37,12 +52,12 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %            switches its Rademacher probes to the sphere, because a +-1
 %            quadratic form is exact on a diagonal matrix and would make that
 %            tier's error degenerate rather than sampled.
-%   k        Phase-1 rank (SCALAR). The Phase-1 sketch is a SparseStack/SASO
+%   k        Phase-1 rank (SCALAR). The Phase-1 sketch is a SASO
 %            generated INSIDE RandLAPACK::NystromEVD from (SketchSeed, VecNnz),
 %            matching the paper's Algorithm 1 line 1. Explicit Omega1 matrices
 %            are no longer accepted (the dense-sketch mode was removed from
 %            the kernel).
-%   arg3     Phase-2 Hutchinson probes. Pass a SCALAR s and the n x s Gaussian
+%   arg3     Phase-2 Hutchinson probes. Pass a SCALAR s and the n x s sphere
 %            probes are sampled internally (seed = SketchSeed + 1000); OR pass
 %            an explicit n x s matrix (escape hatch for validation, e.g.
 %            feeding every estimator in a comparison the SAME probes).
@@ -63,7 +78,9 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %   verbatim (e.g. every harness call).
 %
 %   Optional Name-Value pairs:
-%     'Func'        char in {'sqrt', 'log', 'poly', 'effdim', 'square', 'identity'}
+%     'Func'        char in {'sqrt', 'log', 'poly', 'effdim', 'square', 'identity', 'entropy'}
+%                   entropy = -x*log(x), with f(0)=0; fixed/exact oracle only,
+%                   outside the operator-monotone certificate assumptions.
 %                   (default 'sqrt'). 'poly' is f(x) = x(x + PolyLambda);
 %                   'effdim' is f(x) = x/(x + PolyLambda) (the "effective
 %                   dimension" function; operator monotone).
@@ -81,8 +98,10 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %                   2 = legacy window rule (honors AdaptiveDelay/AdaptiveMin).
 %                   With Adaptive = 1, 'RadauReturn' picks the returned value
 %                   (0 = block Gauss, 1 = (Gauss+Radau)/2 midpoint) and the
-%                   times struct reports the tr_U >= tr_L bracket plus the
-%                   certified flag.
+%                   times struct reports the tr_U / tr_L bracket plus the
+%                   certified flag. tr_U >= tr_L holds in the operator-
+%                   monotone regime; the default MaxBoth scaling does not
+%                   assume it.
 %                   'scalar_qfa' = scalar Lanczos-QFA: the per-probe quadratic
 %                   forms directly (basis-free, O(n·s) memory). With
 %                   'Adaptive',1 each probe stops at its own depth via the
@@ -146,12 +165,28 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %                   by n and by AutoProbeFrac).
 %     'AutoProbeFrac' LFAType 'auto' only: fraction of the matvec Budget the
 %                   depth probe may spend, in (0, 1) (default 0.125).
+%     'AdaptiveKConst' / 'AdaptiveSConst' LFAType 'adaptive' only: the leading
+%                   constants of the split rule k = c_k*sqrt(t)/eps,
+%                   s = max(1, c_s/(sqrt(t)*eps)). Both default to 1, which is
+%                   the paper's unit-constant allocation; the asymptotic rate is
+%                   unchanged by either constant, only the allocation at a given
+%                   (t, eps).
+%     'CapRankFraction' Target-based tiers ('adaptive', 'scalar_auto',
+%                   'block_auto'): maximum rank share of post-pilot work,
+%                   applied only when the target allocation exceeds the cap.
+%                   In (0,1]; default 1 preserves historical rank-first clipping.
+%     'QuadratureFraction' Same tiers: multiply AutoEps by this fraction for
+%                   pilot and final Lanczos stopping, leaving the rank/probe
+%                   target unchanged. In (0,1], default 1. This does not certify
+%                   total stochastic error. Intended for controlled diagnostics.
+%     'FirstRowQL' Optional scalar projected evaluator, default false. Single
+%                   precision and nonconverged QL solves use stevd. Returned
+%                   times record the request and any pilot/final fallback.
 %     'AdaptiveMatvecCap' LFAType 'adaptive' only: optional total matvec cap
 %                   (default 0 = no cap). Ignored by every other LFAType.
-%     'Sketch'      DEPRECATED/IGNORED (default 'saso'). The Phase-1 sketch is
-%                   always the kernel-internal SASO; anything other than 'saso'
-%                   triggers a warning from the MEX. Kept so existing call
-%                   sites keep running.
+%     'Sketch'      Compatibility option: only 'saso' is supported. The Phase-1 sketch is
+%                   always the kernel-internal SASO. Other values are rejected
+%                   before calling MEX because they do not select another sketch.
 %     'VecNnz'      nonzeros per ROW of the SASO sketch (default 8;
 %                   0 = auto, resolved to ~log(k) inside the kernel)
 %     'SketchSeed'  RNG seed for the Phase-1 sketch (default 42)
@@ -197,7 +232,7 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     if ~isscalar(k)
         error('randlapack:fun_nystrom_pp:Omega1Explicit', ...
               ['arg 2 must be a scalar rank k. Explicit Omega1 matrices are no ' ...
-               'longer supported: the Phase-1 sketch is a SparseStack/SASO ' ...
+               'longer supported: the Phase-1 sketch is a SASO ' ...
                'generated inside RandLAPACK (control it via ''SketchSeed'' and ' ...
                '''VecNnz'').']);
     end
@@ -265,6 +300,16 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     % Eps-targeted tier (LFAType 'adaptive') only: optional total matvec cap
     % (0 = no cap).
     addParameter(p, 'AdaptiveMatvecCap', 0,   @(x) isnumeric(x) && isscalar(x) && x >= 0);
+    % Eps-targeted tier only: leading constants of the (k, s) split rule; 1 = the
+    % paper's unit constants.
+    addParameter(p, 'AdaptiveKConst', 1,      @(x) isnumeric(x) && isscalar(x) && x > 0);
+    addParameter(p, 'AdaptiveSConst', 1,      @(x) isnumeric(x) && isscalar(x) && x > 0);
+    % Allocation diagnostics for target-driven modes. Defaults reproduce the
+    % September 15 policy; high-level trace_estimate chooses the tested policy.
+    addParameter(p, 'CapRankFraction', 1, @(x) isnumeric(x) && isscalar(x) && x>0 && x<=1);
+    addParameter(p, 'QuadratureFraction', 1, @(x) isnumeric(x) && isscalar(x) && x>0 && x<=1);
+    % Equivalent scalar projected evaluator; float and failed QL use stevd.
+    addParameter(p, 'FirstRowQL', false, @(x) isscalar(x) && (islogical(x) || isnumeric(x)) && any(x==[0 1]));
     % Default-on symmetry check (see the 'A' doc above); set true to skip it.
     addParameter(p, 'SkipSymCheck', false,    @(x) isscalar(x) && (islogical(x) || isnumeric(x)));
     parse(p, varargin{:});
@@ -274,6 +319,11 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     pl       = double(p.Results.PolyLambda);
     lfa_type = char(p.Results.LFAType);
     sketch   = char(p.Results.Sketch);
+    if ~strcmpi(sketch,'saso')
+        error('randlapack:fun_nystrom_pp:unsupportedSketch', ...
+            ['Only the internally generated SASO sketch is supported. ' ...
+             'Use VecNnz to change its density; other Sketch values previously had no effect.']);
+    end
     vec_nnz  = double(p.Results.VecNnz);
     sk_seed  = double(p.Results.SketchSeed);
     reorth   = double(p.Results.Reorth);
@@ -287,6 +337,10 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     auto_dcap = double(p.Results.AutoDepthCap);
     auto_pfr  = double(p.Results.AutoProbeFrac);
     adapt_mvc = double(p.Results.AdaptiveMatvecCap);
+    adapt_kc  = double(p.Results.AdaptiveKConst);
+    adapt_sc  = double(p.Results.AdaptiveSConst);
+    cap_rank_fraction = double(p.Results.CapRankFraction);
+    quadrature_fraction = double(p.Results.QuadratureFraction);
     skip_sym_check = logical(p.Results.SkipSymCheck);
 
     % --- Ignored-knob warnings (moved here from the MEX; see the doc note
@@ -302,27 +356,33 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     switch lfa_type
         case 'exact'
             ignored = {'Depth', 'Reorth', 'Adaptive', 'AdaptiveTol', ...
-                       'AdaptiveDelay', 'AdaptiveMin', 'RadauReturn', 'AdaptiveMatvecCap'};
+                       'AdaptiveDelay', 'AdaptiveMin', 'RadauReturn', 'AdaptiveMatvecCap', ...
+                       'AdaptiveKConst', 'AdaptiveSConst'};
         case 'scalar'
             ignored = {'Adaptive', 'AdaptiveTol', 'AdaptiveDelay', 'AdaptiveMin', ...
-                       'RadauReturn', 'AdaptiveMatvecCap'};
+                       'RadauReturn', 'AdaptiveMatvecCap', 'AdaptiveKConst', 'AdaptiveSConst'};
         case 'scalar_qfa'
-            ignored = {'Reorth', 'AdaptiveDelay', 'AdaptiveMin', 'RadauReturn', 'AdaptiveMatvecCap'};
+            ignored = {'Reorth', 'AdaptiveDelay', 'AdaptiveMin', 'RadauReturn', ...
+                       'AdaptiveMatvecCap', 'AdaptiveKConst', 'AdaptiveSConst'};
         case 'block'
             ignored = {'Adaptive', 'AdaptiveTol', 'AdaptiveDelay', 'AdaptiveMin', ...
-                       'RadauReturn', 'AdaptiveMatvecCap'};
+                       'RadauReturn', 'AdaptiveMatvecCap', 'AdaptiveKConst', 'AdaptiveSConst'};
         case 'block_qfa'
-            ignored = {'AdaptiveMatvecCap'};
+            ignored = {'AdaptiveMatvecCap', 'AdaptiveKConst', 'AdaptiveSConst'};
         case 'auto'
             ignored = {'Q', 'Depth', 'Reorth', 'Adaptive', 'AdaptiveTol', ...
-                       'AdaptiveDelay', 'AdaptiveMin', 'RadauReturn', 'AdaptiveMatvecCap'};
-        case 'adaptive'
+                       'AdaptiveDelay', 'AdaptiveMin', 'RadauReturn', 'AdaptiveMatvecCap', ...
+                       'AdaptiveKConst', 'AdaptiveSConst'};
+        case {'adaptive', 'scalar_auto', 'block_auto'}
             ignored = {'Q', 'Depth', 'Reorth', 'Adaptive', 'AdaptiveTol', ...
                        'AdaptiveDelay', 'AdaptiveMin', 'RadauReturn'};
         otherwise
             % Unknown lfa_type: leave the diagnostic to the MEX's own
             % 'randlapack:fun_nystrom_pp_mex:lfa_type' error.
             ignored = {};
+    end
+    if ~ismember(lfa_type, {'adaptive','scalar_auto','block_auto'})
+        ignored = [ignored, {'CapRankFraction','QuadratureFraction'}];
     end
     explicitly_ignored = ignored(~ismember(ignored, p.UsingDefaults));
     if ~isempty(explicitly_ignored)
@@ -338,7 +398,7 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     % placeholder spelling used by every call site (including this
     % project's own harness), not a sign of a caller expecting their probes
     % to be used.
-    if any(strcmp(lfa_type, {'auto', 'adaptive'})) && ~isscalar(Omega2) && ~isempty(Omega2)
+    if any(strcmp(lfa_type, {'auto', 'adaptive', 'scalar_auto', 'block_auto'})) && ~isscalar(Omega2) && ~isempty(Omega2)
         warning('randlapack:fun_nystrom_pp:ignored_knob', ...
                 ['explicit Omega2 matrix ignored for LFAType ''%s'': this tier derives ' ...
                  'its own Phase-2 probes from a certified depth probe and never reads a ' ...
@@ -349,7 +409,7 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     % finding: previously the two checks used different, undocumented ids;
     % unified so direct fun_nystrom_pp_mex(...) callers see the identical
     % identifier this wrapper would have raised).
-    if strcmp(lfa_type, 'auto') && budget < 1
+    if any(strcmp(lfa_type, {'auto', 'scalar_auto', 'block_auto'})) && budget < 1
         error('randlapack:fun_nystrom_pp:Budget', ...
               'LFAType ''auto'' requires a positive ''Budget'' (total A-matvec budget).');
     end
@@ -359,9 +419,8 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
         d = double(p.Results.Depth);
     end
 
-    % --- Symmetry validation (default on; tolerance-gated). The MEX always
-    % reads only the upper triangle of A and mirrors it into the lower
-    % triangle; an asymmetric A therefore has its lower triangle silently
+    % --- Symmetry validation (default on; tolerance-gated). The MEX treats
+    % the upper triangle as authoritative; an asymmetric A has its lower triangle
     % discarded with no other signal. Checked here, not in the MEX, so a
     % direct fun_nystrom_pp_mex(...) call remains a raw low-level entry point
     % (matches the header comment's "low-level" framing) while every call
@@ -380,7 +439,7 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
                   ['A must be symmetric (checked within tolerance): ' ...
                    'max(abs(A-A'')) = %.3e exceeds tol*max(abs(A)) = %.3e ' ...
                    '(tol = sqrt(eps(''%s'')) = %.1e). The MEX reads only the ' ...
-                   'upper triangle and mirrors it into the lower triangle; a ' ...
+                   'upper triangle as the symmetric matrix; a ' ...
                    'non-symmetric A silently has its lower triangle discarded. ' ...
                    'If A is known to be symmetric (e.g. by construction) and ' ...
                    'this O(n^2) check is unwanted overhead at large n, pass ' ...
@@ -395,7 +454,10 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     mex_args = {A, a1, a2, func, q, pl, lfa_type, d, ...
                 sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, ...
                 adapt_dl, adapt_mn, budget, auto_eps, radau_ret, ...
-                auto_dcap, auto_pfr, adapt_mvc};
+                auto_dcap, auto_pfr, adapt_mvc, adapt_kc, adapt_sc, ...
+                cap_rank_fraction, quadrature_fraction};
+    % Preserve the legacy positional call when this optional route is disabled.
+    if p.Results.FirstRowQL,mex_args{end+1}=1;end
     if nargout <= 1
         est = fun_nystrom_pp_mex(mex_args{:});
     elseif nargout == 2
