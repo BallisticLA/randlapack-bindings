@@ -97,6 +97,13 @@
 //   adaptive_matvec_cap  'adaptive' tier only: optional total matvec cap (0 =
 //                   no cap, the default). Ignored by every other lfa_type.
 //                                                       [optional, input 22]
+//   ...         optional inputs 23-27 (adaptive_k_const, adaptive_s_const,
+//               cap_rank_fraction, quadrature_fraction, first_row_ql) are
+//               documented inline where they are read.
+//   spend_cap   'scalar_auto'/'block_auto' only: 1 = spend the whole Budget
+//               (driver.adaptive_spend_cap: rank and probe count chosen to use
+//               the cap, Phase-2 probes at the probe's depth with no early
+//               stop); 0 = shipped behaviour (default)  [optional, input 28]
 //
 // Outputs:
 //   est         trace estimate t1 + t2 (scalar double)
@@ -170,12 +177,14 @@
 //                 tr_L           'block_qfa'/'adaptive' only: final block
 //                                Gauss-Radau trace (lower side; equals tr_U when
 //                                no certificate ran); for 'adaptive' this is
-//                                driver.adaptive_tr_L; NaN otherwise.
+//                                driver.adaptive_tr_L, NaN under spend_cap (no
+//                                bracket evaluated in Phase 2); NaN otherwise.
 //                 certified      'block_qfa'/'adaptive'/'scalar_qfa' (with
 //                                Adaptive=1) only: 1 if the Radau bracket
 //                                closed within (adaptive_tol / auto_eps), 0 if
 //                                not; for 'adaptive' this is
-//                                driver.adaptive_phase2_certified; for
+//                                driver.adaptive_phase2_certified (NaN under
+//                                spend_cap); for
 //                                'scalar_qfa' this is scalar_qfa.all_certified
 //                                (every probe column certified before the
 //                                depth cap); NaN otherwise (including
@@ -196,6 +205,10 @@
 //                                ONLY the probe; 'adaptive' reads
 //                                driver.adaptive_phase2_certified); NaN
 //                                otherwise.
+//                 phase2_checked 'adaptive' only: 1 if Phase 2 evaluated its
+//                                bracket, 0 under spend_cap (phase2_certified,
+//                                certified and tr_L are then NaN because
+//                                nothing was checked); NaN otherwise.
 //
 // A may be single or double; the computation runs in that precision and the
 // scalar outputs are returned as double. Omega1/Omega2 must match the class
@@ -427,6 +440,12 @@ private:
         const double first_row_ql = (inputs.size() >= 27) ? read_double(inputs[26], "first_row_ql") : 0.0;
         if (first_row_ql != 0.0 && first_row_ql != 1.0)
             raise("randlapack:fun_nystrom_pp_mex:first_row_ql", "first_row_ql must be 0 or 1");
+        const double spend_cap = (inputs.size() >= 28) ? read_double(inputs[27], "spend_cap") : 0.0;
+        if (spend_cap != 0.0 && spend_cap != 1.0)
+            raise("randlapack:fun_nystrom_pp_mex:spend_cap", "spend_cap must be 0 or 1");
+        if (spend_cap != 0.0 && !target_auto)
+            raise("randlapack:fun_nystrom_pp_mex:spend_cap",
+                  "spend_cap applies only to lfa_type 'scalar_auto' or 'block_auto'");
 
         if (!std::isfinite(adaptive_kc) || !std::isfinite(adaptive_sc) ||
             !(adaptive_kc > 0.0) || !(adaptive_sc > 0.0)) {
@@ -627,6 +646,7 @@ private:
         driver.adaptive_s_const    = static_cast<T>(adaptive_sc);
         driver.adaptive_cap_rank_fraction = static_cast<T>(cap_rank_fraction);
         driver.adaptive_quadrature_fraction = static_cast<T>(quadrature_fraction);
+        driver.adaptive_spend_cap = (spend_cap != 0.0);
 
         T t1 = (T)0, t2 = (T)0, est = (T)0;
         const T *Omega2_ptr = phase2_skipped ? nullptr : O2_buf;
@@ -865,6 +885,9 @@ private:
                     }
                     tr_U_out = su; tr_L_out = sl;
                 }
+                // spend_cap: Phase 2 ran at fixed depth and evaluated no bracket, so the lower
+                // side and the certificate are not measurements (the oracles leave 0 or tr_U there).
+                if (!driver.adaptive_phase2_checked) { tr_L_out = nan_v; cert_out = nan_v; }
             } else if (lfa_type == "scalar_qfa" && scalar_qfa.adaptive) {
                 // NaN when Adaptive=0 (fixed depth): no certificate was ever
                 // checked, so all_certified's default-false would misreport
@@ -881,7 +904,7 @@ private:
                     tr_U_out = su; tr_L_out = sl;
                 }
             }
-            double probe_ms_out = nan_v, probe_conv_out = nan_v, ph2_cert_out = nan_v;
+            double probe_ms_out = nan_v, probe_conv_out = nan_v, ph2_cert_out = nan_v, ph2_checked_out = nan_v;
             if (is_auto) {
                 probe_ms_out   = driver.t_probe_ms;
                 probe_conv_out = driver.auto_probe_converged ? 1.0 : 0.0;
@@ -889,7 +912,8 @@ private:
             } else if (is_adaptive) {
                 probe_ms_out   = driver.t_adaptive_probe_ms;
                 probe_conv_out = driver.adaptive_probe_certified ? 1.0 : 0.0;
-                ph2_cert_out   = driver.adaptive_phase2_certified ? 1.0 : 0.0;
+                ph2_cert_out   = driver.adaptive_phase2_checked ? (driver.adaptive_phase2_certified ? 1.0 : 0.0) : nan_v;
+                ph2_checked_out = driver.adaptive_phase2_checked ? 1.0 : 0.0;
             }
             matlab::data::StructArray ts = factory.createStructArray({1, 1},
                 {"marshal_in_ms", "phase1_ms", "phase2_ms", "fafun_ms",
@@ -899,7 +923,7 @@ private:
                  "probe_ms", "probe_converged", "phase2_certified",
                  "first_row_ql_requested", "first_row_ql_fallback", "symmetric_sketch",
                  "ritz_clamped", "rank_deficient_steps", "min_diag_ratio",
-                 "nystrom_clamped", "bracket_evaluated"});
+                 "nystrom_clamped", "bracket_evaluated", "phase2_checked"});
             ts[0]["marshal_in_ms"] = factory.createScalar<double>(marshal_in_ms);
             ts[0]["phase1_ms"]     = factory.createScalar<double>(driver.t_phase1_ms);
             ts[0]["phase2_ms"]     = factory.createScalar<double>(driver.t_phase2_ms);
@@ -921,6 +945,7 @@ private:
             ts[0]["probe_ms"]      = factory.createScalar<double>(probe_ms_out);
             ts[0]["probe_converged"]  = factory.createScalar<double>(probe_conv_out);
             ts[0]["phase2_certified"] = factory.createScalar<double>(ph2_cert_out);
+            ts[0]["phase2_checked"]   = factory.createScalar<double>(ph2_checked_out);
             ts[0]["first_row_ql_requested"] = factory.createScalar<bool>(first_row_ql != 0.0);
             ts[0]["first_row_ql_fallback"] = factory.createScalar<bool>(
                 scalar_qfa.first_row_ql_fallback_seen || driver.auto_sqfa.first_row_ql_fallback_seen);
@@ -965,14 +990,14 @@ public:
 
     void operator()(ArgumentList outputs, ArgumentList inputs) {
         try {
-            if (inputs.size() < 8 || inputs.size() > 27) {
+            if (inputs.size() < 8 || inputs.size() > 28) {
                 raise("randlapack:fun_nystrom_pp_mex:nargin",
-                      "Expected 8 to 27 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
+                      "Expected 8 to 28 inputs: A, Omega1, Omega2, func, q, poly_lambda, "
                       "lfa_type, d [, sketch_type, vec_nnz, sketch_seed, reorth, "
                       "adaptive, adaptive_tol, adaptive_delay, adaptive_min, "
                       "budget, auto_eps, radau_return, auto_depth_cap, "
                       "auto_probe_frac, adaptive_matvec_cap, adaptive_k_const, "
-                      "adaptive_s_const, cap_rank_fraction, quadrature_fraction, first_row_ql]");
+                      "adaptive_s_const, cap_rank_fraction, quadrature_fraction, first_row_ql, spend_cap]");
             }
             if (outputs.size() < 1 || outputs.size() > 4) {
                 raise("randlapack:fun_nystrom_pp_mex:nargout",

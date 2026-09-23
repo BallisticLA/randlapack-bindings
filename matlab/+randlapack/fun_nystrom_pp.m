@@ -79,8 +79,9 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %
 %   Optional Name-Value pairs:
 %     'Func'        char in {'sqrt', 'log', 'poly', 'effdim', 'square', 'identity', 'entropy'}
-%                   entropy = -x*log(x), with f(0)=0; fixed/exact oracle only,
-%                   outside the operator-monotone certificate assumptions.
+%                   entropy = -x*log(x), with f(0)=0; the Gauss/Gauss-Radau
+%                   certificate applies from depth 2 (the scalar_auto and
+%                   block_auto tiers accept it).
 %                   (default 'sqrt'). 'poly' is f(x) = x(x + PolyLambda);
 %                   'effdim' is f(x) = x/(x + PolyLambda) (the "effective
 %                   dimension" function; operator monotone).
@@ -179,6 +180,12 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %                   pilot and final Lanczos stopping, leaving the rank/probe
 %                   target unchanged. In (0,1], default 1. This does not certify
 %                   total stochastic error. Intended for controlled diagnostics.
+%     'SpendCap'    'scalar_auto'/'block_auto' only, default false. True spends
+%                   the whole Budget: rank and probe count are chosen to use the
+%                   cap (at least 4 probes), and every Phase-2 probe runs to the
+%                   probe's depth with no early stop, so times.phase2_checked
+%                   is 0 and times.phase2_certified, times.certified and
+%                   times.tr_L are NaN (nothing was checked).
 %     'FirstRowQL' Optional scalar projected evaluator, default false. Single
 %                   precision and nonconverged QL solves use stevd. Returned
 %                   times record the request and any pilot/final fallback.
@@ -309,6 +316,7 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     addParameter(p, 'CapRankFraction', 1, @(x) isnumeric(x) && isscalar(x) && x>0 && x<=1);
     addParameter(p, 'QuadratureFraction', 1, @(x) isnumeric(x) && isscalar(x) && x>0 && x<=1);
     % Equivalent scalar projected evaluator; float and failed QL use stevd.
+    addParameter(p, 'SpendCap', false, @(x) isscalar(x) && (islogical(x) || isnumeric(x)) && any(x==[0 1]));
     addParameter(p, 'FirstRowQL', false, @(x) isscalar(x) && (islogical(x) || isnumeric(x)) && any(x==[0 1]));
     % Default-on symmetry check (see the 'A' doc above); set true to skip it.
     addParameter(p, 'SkipSymCheck', false,    @(x) isscalar(x) && (islogical(x) || isnumeric(x)));
@@ -384,6 +392,10 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     if ~ismember(lfa_type, {'adaptive','scalar_auto','block_auto'})
         ignored = [ignored, {'CapRankFraction','QuadratureFraction'}];
     end
+    spend_cap = logical(p.Results.SpendCap) && ismember(lfa_type, {'scalar_auto','block_auto'});
+    if ~ismember(lfa_type, {'scalar_auto','block_auto'})
+        ignored = [ignored, {'SpendCap'}];
+    end
     explicitly_ignored = ignored(~ismember(ignored, p.UsingDefaults));
     if ~isempty(explicitly_ignored)
         warning('randlapack:fun_nystrom_pp:ignored_knob', ...
@@ -457,7 +469,8 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
                 auto_dcap, auto_pfr, adapt_mvc, adapt_kc, adapt_sc, ...
                 cap_rank_fraction, quadrature_fraction};
     % Preserve the legacy positional call when this optional route is disabled.
-    if p.Results.FirstRowQL,mex_args{end+1}=1;end
+    if p.Results.FirstRowQL || spend_cap, mex_args{end+1} = double(logical(p.Results.FirstRowQL)); end
+    if spend_cap, mex_args{end+1} = 1; end
     if nargout <= 1
         est = fun_nystrom_pp_mex(mex_args{:});
     elseif nargout == 2

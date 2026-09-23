@@ -525,6 +525,67 @@ function test_fun_nystrom_pp()
         assert(strcmp(got_id, 'randlapack:fun_nystrom_pp:A_shape'), ...
                '[%s] 3 x 4 A raised ''%s'', expected A_shape', cls, got_id);
 
+        % SpendCap (2026-09-23): the self-tuning tiers spend the cap up to one probe, run every
+        % probe to the pilot's depth (phase2_checked = 0) and report the pilot's certificate; the
+        % default call is the shipped tier, with Phase 2 checked.
+        if strcmp(cls, 'double')
+            lam_s = logspace(0, -3, 3000)';
+            for m = {'scalar_auto', 'block_auto'}
+                [~, i0] = randlapack.trace_estimate(lam_s, 'Method', m{1}, 'Func', 'log', ...
+                    'TargetRelError', 0.3, 'MaxMatvecs', 1024, 'Seed', 5);
+                [~, i1] = randlapack.trace_estimate(lam_s, 'Method', m{1}, 'Func', 'log', ...
+                    'TargetRelError', 0.3, 'MaxMatvecs', 1024, 'Seed', 5, 'SpendCap', true);
+                assert(i0.phase2_checked == 1 && i1.phase2_checked == 0, ...
+                       '%s: phase2_checked %g / %g, expected 1 / 0', m{1}, i0.phase2_checked, i1.phase2_checked);
+                assert(i1.matvecs <= 1024 && 1024 - i1.matvecs < max(i1.d_used, 1), ...
+                       '%s: SpendCap spent %d of 1024 at depth %d', m{1}, i1.matvecs, i1.d_used);
+                assert(i1.matvecs > i0.matvecs, '%s: SpendCap spent no more than shipped (%d vs %d)', ...
+                       m{1}, i1.matvecs, i0.matvecs);
+                assert(i1.quadrature_certified == logical(i1.probe_converged), ...
+                       '%s: SpendCap must report the pilot certificate', m{1});
+                % the allocation is detail::spend_cap_split's (ported below), not merely some split
+                % that spends the cap: at n = 3000, cap 4096 and pilot depth 93 it is (1500, 23), where
+                % the rejected spend-maximizing rule gave (1492, 24)
+                for nb = 3000
+                    lam_b = logspace(0, 4, nb)';
+                    for cap = [1024, 4096]
+                        [~, ib] = randlapack.trace_estimate(lam_b, 'Method', m{1}, 'Func', 'log', ...
+                            'TargetRelError', 1e-3, 'MaxMatvecs', cap, 'Seed', 5, 'SpendCap', true);
+                        [ke, se] = spend_cap_split(cap - ib.probe_mv, ib.d_used, nb, 1, 4, strcmp(m{1}, 'block_auto'));
+                        assert(ib.auto_k == ke && ib.auto_s == se, ...
+                               '%s n=%d cap=%d t=%d: (k, s) = (%d, %d), spend_cap_split gives (%d, %d)', ...
+                               m{1}, nb, cap, ib.d_used, ib.auto_k, ib.auto_s, ke, se);
+                    end
+                end
+                % nothing was checked in Phase 2, so its lower side and certificate are NaN
+                assert(isnan(i1.tr_L) && isnan(i1.phase2_certified) && isfinite(i1.tr_U) && ...
+                       isfinite(i0.tr_L) && ~isnan(i0.phase2_certified), ...
+                       '%s: SpendCap tr_L %g, phase2_certified %g (expected NaN); shipped tr_L %g', ...
+                       m{1}, i1.tr_L, i1.phase2_certified, i0.tr_L);
+            end
+            got_id = '';
+            try
+                randlapack.trace_estimate(lam_s, 'Method', 'block', 'Func', 'log', ...
+                    'MaxMatvecs', 256, 'Depth', 8, 'SpendCap', true);
+            catch err
+                got_id = err.identifier;
+            end
+            assert(strcmp(got_id, 'randlapack:trace_estimate:spendCap'), ...
+                   'SpendCap on a fixed method raised ''%s''', got_id);
+        end
+
         fprintf('test_fun_nystrom_pp [%6s]: OK\n', cls);
     end
+end
+
+function [k, s] = spend_cap_split(avail, t, n, q, s_min, block_krylov)
+% MATLAB copy of RandLAPACK detail::spend_cap_split (rl_fun_nystrom_pp.hh): half of the post-probe
+% budget to the rank (at most n - s_min), at least s_min probes, the rank taking what dimension
+% limits leave unspent.
+    t = max(1, t); q = max(1, q); kcap = max(1, fix(n / 2));
+    k0 = max(1, min([kcap, n - s_min, fix(avail / (2 * q)), fix((avail - s_min * t) / q)]));
+    s = min(fix((avail - q * k0) / t), n - k0);
+    if block_krylov, s = min(s, fix(n / t)); end
+    s = max(0, s);
+    k = max(k0, min([kcap, n - s, fix((avail - s * t) / q)]));
 end

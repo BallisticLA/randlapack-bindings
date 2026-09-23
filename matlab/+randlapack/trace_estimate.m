@@ -21,7 +21,11 @@ function [estimate, info] = trace_estimate(A, varargin)
 % shift for effdim x/(x+Lambda), default 10 (same as the low-level interface).
 % VecNnz controls SASO nonzeros per row (default 8, clipped to rank).
 % VecNnz=0 uses the kernel's logarithmic density rule. Sketch type is SASO.
-% Entropy is available with fixed methods only. See fun_nystrom_pp.
+% Entropy is available with every method. See fun_nystrom_pp.
+% SpendCap (auto methods only, default false) makes the method spend the whole
+% cap: rank and probe count use it, every probe runs to the pilot's depth, and
+% quadrature_certified then reports the pilot's certificate, since nothing
+% later is checked.
 % FirstRowQL optionally accelerates scalar projected solves. Single precision
 % and nonconverged QL solves retain the established evaluator. Its use and any
 % fallback, including the pilot, are recorded in info.
@@ -35,6 +39,7 @@ function [estimate, info] = trace_estimate(A, varargin)
     addParameter(p, 'Depth', []);
     addParameter(p, 'Seed', 42);
     addParameter(p, 'SkipSymCheck', false);
+    addParameter(p, 'SpendCap', false, @(x) isscalar(x) && (islogical(x) || isnumeric(x)) && any(x==[0 1]));
     addParameter(p, 'FirstRowQL', false, @(x) isscalar(x) && (islogical(x) || isnumeric(x)) && any(x==[0 1]));
     parse(p, varargin{:});
     o = p.Results;
@@ -57,11 +62,14 @@ function [estimate, info] = trace_estimate(A, varargin)
         validatestring(func, {'sqrt','log','effdim','identity','entropy'});
         [estimate, ~, ~, t] = randlapack.fun_nystrom_pp(A, 1, 1, args{:}, ...
             'LFAType', method, 'Budget', B, 'AutoEps', o.TargetRelError, ...
-            'CapRankFraction', 0.5);
+            'CapRankFraction', 0.5, 'SpendCap', logical(o.SpendCap));
         k = t.auto_k; s = t.auto_s; pilot = t.probe_mv;
-        cert = logical(t.phase2_certified);
+        if o.SpendCap, cert = logical(t.probe_converged); else, cert = logical(t.phase2_certified); end
         pilot_ms = t.probe_ms;
     else
+        if o.SpendCap
+            error('randlapack:trace_estimate:spendCap', 'SpendCap applies only to scalar_auto and block_auto.');
+        end
         validateattributes(o.Depth, {'numeric'}, {'scalar','finite','integer','positive'});
         d = min(n, o.Depth);
         k = max(1, min(floor(n/2), floor(B/2)));
@@ -91,6 +99,7 @@ function [estimate, info] = trace_estimate(A, varargin)
     info.max_matvecs = B;
     info.total_error_certified = false;
     info.cap_rank_fraction = 0.5;
+    info.spend_cap = logical(o.SpendCap);
     info.sketch = 'saso';
     info.vec_nnz_requested = o.VecNnz;
     info.vec_nnz_effective = min(k,o.VecNnz);
