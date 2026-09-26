@@ -46,8 +46,9 @@ function test_fun_nystrom_pp()
 %     Lanczos recurrence runs)
 %   * 'Reorth' outside {0, 1} is rejected by inputParser validation
 %     ('MATLAB:InputParser:ArgumentFailedValidation')
-%   * a sparse A is rejected with the specific id validateattributes raises
-%     ('MATLAB:fun_nystrom_pp:expectedNonsparse'), not just "some error"
+%   * a sparse double A is accepted and agrees with the dense call at the
+%     same seed to rounding; 'exact' on a sparse A is refused with the
+%     specific id 'randlapack:fun_nystrom_pp_mex:exact_sparse'
 %
 % Run: test_fun_nystrom_pp   (errors via assert on failure; for CI).
 
@@ -426,13 +427,12 @@ function test_fun_nystrom_pp()
         assert(strcmp(got_id, 'randlapack:fun_nystrom_pp:Budget'), ...
                '[%s] Budget=0 raised ''%s'', expected the unified Budget id', cls, got_id);
 
-        % --- 15. 'nonsparse' validation (M3): a sparse A is rejected cleanly
-        %         by the .m wrapper instead of reaching the MEX, with the
-        %         SPECIFIC id validateattributes raises (pinned, not just
-        %         "some error" -- a future validateattributes/MATLAB version
-        %         change to that id should fail this test loudly). MATLAB's
-        %         sparse() only supports double storage, so this only runs
-        %         for cls == 'double'. ---
+        % --- 15. Sparse input: a sparse double A (both triangles stored)
+        %         is accepted and must agree with the dense call at the same
+        %         seed to rounding; 'exact' needs a dense eigensolve and is
+        %         refused with its specific id. MATLAB's sparse() only
+        %         supports double storage, so this only runs for
+        %         cls == 'double'. ---
         if strcmp(cls, 'double')
             got_id = '';
             try
@@ -441,9 +441,15 @@ function test_fun_nystrom_pp()
             catch err
                 got_id = err.identifier;
             end
-            assert(strcmp(got_id, 'MATLAB:fun_nystrom_pp:expectedNonsparse'), ...
-                   '[%s] sparse A raised ''%s'', expected MATLAB:fun_nystrom_pp:expectedNonsparse', ...
+            assert(strcmp(got_id, 'randlapack:fun_nystrom_pp_mex:exact_sparse'), ...
+                   '[%s] exact on sparse A raised ''%s'', expected randlapack:fun_nystrom_pp_mex:exact_sparse', ...
                    cls, got_id);
+            e_sparse = randlapack.fun_nystrom_pp(sparse(A), k, s, 'Func', 'sqrt', ...
+                'LFAType', 'block_qfa', 'Depth', 20, 'Q', 1, 'SketchSeed', 7);
+            e_dense  = randlapack.fun_nystrom_pp(A, k, s, 'Func', 'sqrt', ...
+                'LFAType', 'block_qfa', 'Depth', 20, 'Q', 1, 'SketchSeed', 7);
+            assert(abs(e_sparse - e_dense) <= 1e-10 * abs(e_dense), ...
+                   '[%s] sparse and dense A disagree: %.17g vs %.17g', cls, e_sparse, e_dense);
         end
 
         % --- 16. Reorth-range rejection: 'Reorth' outside {0, 1} is rejected

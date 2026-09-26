@@ -232,6 +232,9 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <type_traits>
+#include <cstdlib>
 #include <vector>
 
 namespace linops  = RandLAPACK::linops;
@@ -261,6 +264,7 @@ using matlab::data::Array;
 using matlab::data::ArrayFactory;
 using matlab::data::ArrayType;
 using matlab::data::CharArray;
+using matlab::data::SparseArray;
 template <typename T> using TypedArray = matlab::data::TypedArray<T>;
 
 
@@ -347,8 +351,114 @@ private:
     std::unique_ptr<T[]> copy_into(const Array& in, size_t n_elems) {
         std::unique_ptr<T[]> out(new T[n_elems]);
         const TypedArray<T> typed = in;
+        // Opt-in performance switch, off by default: RANDLAPACK_PERF_PARCOPY=1 splits the copy over
+        // threads. A fresh buffer's pages land on the memory node of the thread that first writes them, so a
+        // one-thread memcpy puts the whole matrix on one node and every later product streams it from there.
+        const char* pc = std::getenv("RANDLAPACK_PERF_PARCOPY");
+        if (pc != nullptr && pc[0] == '1' && n_elems >= ((size_t)1 << 20)) {
+            // Never more threads than cores or than 2^20-element chunks, and never let a failed
+            // thread creation escape: a joinable std::thread destroyed by an exception would
+            // terminate MATLAB. On failure the started threads are joined and the plain copy runs.
+            const char* ot = std::getenv("OMP_NUM_THREADS");
+            const size_t hw = (size_t)std::max(1u, std::thread::hardware_concurrency());
+            size_t nt = ot ? (size_t)std::max(1, std::atoi(ot)) : hw;
+            nt = std::min({nt, hw, n_elems >> 20});
+            const T* src = &*typed.cbegin(); T* dst = out.get();
+            auto chunk = [=](size_t t) {
+                size_t lo = n_elems * t / nt, hi = n_elems * (t + 1) / nt;
+                std::memcpy(dst + lo, src + lo, (hi - lo) * sizeof(T));
+            };
+            std::vector<std::thread> pool;
+            try {
+                pool.reserve(nt);
+                for (size_t t = 1; t < nt; ++t) pool.emplace_back(chunk, t);
+            } catch (const std::exception&) {
+                for (auto& th : pool) th.join();
+                std::memcpy(dst, src, n_elems * sizeof(T));
+                return out;
+            }
+            chunk(0);
+            for (auto& th : pool) th.join();
+            return out;
+        }
         std::memcpy(out.get(), &*typed.cbegin(), n_elems * sizeof(T));
         return out;
+    }
+
+    // Sparse A reaches the MEX from the wrapper as a 1x1 struct of zero-based compressed-column arrays: sparse_n (int64
+    // scalar), colptr (int64, n+1), rowidx (int64, nnz), vals (double, nnz), extracted in MATLAB with find() in O(nnz).
+    // A raw MATLAB sparse array is refused: the Data API hides its buffers, and walking its nonzeros with getIndex costs
+    // O(n) per nonzero (the copy grew 4x per doubling of n: 14 s at n = 40,000, 55 s at 80,000; about an hour at 500k).
+    static bool is_sparse_struct(const Array& a) {
+        if (a.getType() != ArrayType::STRUCT || a.getNumberOfElements() != 1) return false;
+        const matlab::data::StructArray S = a;
+        for (const auto& f : S.getFieldNames())
+            if (std::string(f) == "sparse_n") return true;
+        return false;
+    }
+
+    Array sparse_field(const Array& in, const char* name, ArrayType want) {
+        const matlab::data::StructArray S = in;
+        bool has = false;
+        for (const auto& f : S.getFieldNames())
+            if (std::string(f) == name) has = true;
+        if (!has)
+            raise("randlapack:fun_nystrom_pp_mex:A_sparse_field",
+                  std::string("sparse A struct lacks field '") + name + "' (build it with randlapack.fun_nystrom_pp)");
+        Array a = S[0][name];
+        if (a.getType() != want)
+            raise("randlapack:fun_nystrom_pp_mex:A_sparse_field",
+                  std::string("sparse A field '") + name + "' has the wrong class (int64 for sparse_n, colptr, rowidx; double for vals)");
+        return a;
+    }
+
+    int64_t sparse_n_of(const Array& in) {
+        const TypedArray<int64_t> nA = sparse_field(in, "sparse_n", ArrayType::INT64);
+        if (nA.getNumberOfElements() != 1 || nA[0] < 1)
+            raise("randlapack:fun_nystrom_pp_mex:A_sparse_n", "sparse A: sparse_n must be one positive int64");
+        return nA[0];
+    }
+
+    // Copies and validates the struct's arrays: colptr starts at 0, never decreases and ends at nnz; every row index is
+    // in [0, n) and rows strictly increase within a column (the order element access and the sparse kernels rely on);
+    // every value is finite.
+    void copy_csc(const Array& in, int64_t n, std::unique_ptr<int64_t[]>& colptr, std::unique_ptr<int64_t[]>& rowidx,
+                  std::unique_ptr<double[]>& vals, int64_t& nnz) {
+        const TypedArray<int64_t> cp = sparse_field(in, "colptr", ArrayType::INT64);
+        const TypedArray<int64_t> ri = sparse_field(in, "rowidx", ArrayType::INT64);
+        const TypedArray<double>  vv = sparse_field(in, "vals",   ArrayType::DOUBLE);
+        nnz = static_cast<int64_t>(ri.getNumberOfElements());
+        if (static_cast<int64_t>(cp.getNumberOfElements()) != n + 1)
+            raise("randlapack:fun_nystrom_pp_mex:A_sparse_colptr", "sparse A: colptr must have n+1 entries");
+        if (static_cast<int64_t>(vv.getNumberOfElements()) != nnz)
+            raise("randlapack:fun_nystrom_pp_mex:A_sparse_nnz", "sparse A: rowidx and vals must have the same length");
+        colptr.reset(new int64_t[n + 1]);
+        rowidx.reset(new int64_t[std::max<int64_t>(nnz, 1)]);
+        vals.reset(new double[std::max<int64_t>(nnz, 1)]);
+        std::memcpy(colptr.get(), &*cp.cbegin(), static_cast<size_t>(n + 1) * sizeof(int64_t));
+        if (nnz > 0) {
+            std::memcpy(rowidx.get(), &*ri.cbegin(), static_cast<size_t>(nnz) * sizeof(int64_t));
+            std::memcpy(vals.get(), &*vv.cbegin(), static_cast<size_t>(nnz) * sizeof(double));
+        }
+        if (colptr[0] != 0 || colptr[n] != nnz)
+            raise("randlapack:fun_nystrom_pp_mex:A_sparse_colptr", "sparse A: colptr must start at 0 and end at nnz");
+        for (int64_t j = 0; j < n; ++j)   // all of colptr first: a decrease would merge columns in the row scan below
+            if (colptr[j + 1] < colptr[j])
+                raise("randlapack:fun_nystrom_pp_mex:A_sparse_colptr",
+                      "sparse A: colptr decreases at column " + std::to_string(j + 1));
+        for (int64_t j = 0; j < n; ++j) {
+            for (int64_t p = colptr[j]; p < colptr[j + 1]; ++p) {
+                if (rowidx[p] < 0 || rowidx[p] >= n)
+                    raise("randlapack:fun_nystrom_pp_mex:A_sparse_row",
+                          "sparse A: row index out of range in column " + std::to_string(j + 1));
+                if (p > colptr[j] && rowidx[p] <= rowidx[p - 1])
+                    raise("randlapack:fun_nystrom_pp_mex:A_sparse_order",
+                          "sparse A has unsorted or repeated row indices in column " + std::to_string(j + 1));
+                if (!std::isfinite(vals[p]))
+                    raise("randlapack:fun_nystrom_pp_mex:A_sparse_value",
+                          "sparse A has a non-finite value in column " + std::to_string(j + 1));
+            }
+        }
     }
 
     // Templated worker: reads the T-typed matrices, builds the f(A)*X oracle,
@@ -368,13 +478,23 @@ private:
         // below; the shape was validated in operator().
         const Array& A_in = inputs[0];
         const auto A_dims = A_in.getDimensions();
-        const bool vector_mode = (A_dims.size() == 2) &&
+        // Sparse mode (sparse double A, both triangles stored, passed as the wrapper's CSC struct): a copy of the nonzeros,
+        // no n^2 buffer; A_buf stays null.
+        const bool sparse_mode = is_sparse_struct(A_in);
+        const bool vector_mode = !sparse_mode && (A_dims.size() == 2) &&
             ((A_dims[0] == 1 && A_dims[1] > 1) || (A_dims[1] == 1 && A_dims[0] > 1));
-        const int64_t n = vector_mode
-            ? static_cast<int64_t>(A_in.getNumberOfElements())
+        const int64_t n = sparse_mode ? sparse_n_of(A_in)
+            : vector_mode ? static_cast<int64_t>(A_in.getNumberOfElements())
             : static_cast<int64_t>(A_dims[0]);
-        std::unique_ptr<T[]> A_own = copy_into<T>(
-            A_in, vector_mode ? static_cast<size_t>(n) : static_cast<size_t>(n) * n);
+        std::unique_ptr<T[]> A_own;
+        std::unique_ptr<int64_t[]> sp_colptr, sp_rowidx;
+        std::unique_ptr<double[]> sp_vals;
+        int64_t sp_nnz = 0;
+        if (sparse_mode) {
+            copy_csc(A_in, n, sp_colptr, sp_rowidx, sp_vals, sp_nnz);
+        } else {
+            A_own = copy_into<T>(A_in, vector_mode ? static_cast<size_t>(n) : static_cast<size_t>(n) * n);
+        }
         T* A_buf = A_own.get();
 
         // scalar params (read before sketch handling: internal sampling needs them)
@@ -396,7 +516,9 @@ private:
                   "poly and square have no Radau certificate");
         const int64_t     d           = read_int   (inputs[7], "d");
         const std::string sketch_type = (inputs.size() >= 9)  ? read_string(inputs[8], "sketch_type") : "saso";
-        const int64_t     vec_nnz     = (inputs.size() >= 10) ? read_int(inputs[9],  "vec_nnz")     : 8;
+        const int64_t     vec_nnz_in  = (inputs.size() >= 10) ? read_int(inputs[9],  "vec_nnz")     : 8;
+        // sketch_type 'gaussian' selects NystromEVD's dense Gaussian sketch (vec_nnz = -1).
+        const int64_t     vec_nnz     = (sketch_type == "gaussian") ? -1 : vec_nnz_in;
         const int64_t     sketch_seed = (inputs.size() >= 11) ? read_int(inputs[10], "sketch_seed") : 42;
         // Optional input 12: Lanczos reorthogonalization flag (default 1 = full).
         const int64_t     reorth_flag = (inputs.size() >= 12) ? read_int(inputs[11], "reorth") : 1;
@@ -473,12 +595,12 @@ private:
             raise("randlapack:fun_nystrom_pp_mex:adaptive_matvec_cap",
                   "adaptive_matvec_cap (input 22) must be >= 0 (0 = no cap)");
         }
-        if (vec_nnz < 0) {
+        if (vec_nnz_in < 0) {
             raise("randlapack:fun_nystrom_pp_mex:vec_nnz",
                   "vec_nnz (input 10) must be >= 0 (0 = auto, ~log(k))");
         }
 
-        if (inputs.size() >= 9 && sketch_type != "saso") {
+        if (inputs.size() >= 9 && sketch_type != "saso" && sketch_type != "gaussian") {
             matlabPtr->feval(u"warning", 0, std::vector<Array>{
                 factory.createCharArray("randlapack:fun_nystrom_pp_mex:sketch_type"),
                 factory.createCharArray(
@@ -547,7 +669,7 @@ private:
 
 #ifndef RANDLAPACK_SYMMETRIC_SKETCH
         // The legacy general sketch product requires both triangles.
-        if (!vector_mode) {
+        if (!vector_mode && !sparse_mode) {
             for (int64_t j = 0; j < n; ++j)
                 for (int64_t i = j + 1; i < n; ++i)
                     A_buf[i + j * n] = A_buf[j + i * n];
@@ -668,6 +790,9 @@ private:
                         for (int64_t ii = 0; ii < m_; ++ii)
                             Y[ii + jj * m_] = flam[ii] * B[ii + jj * m_];
                 };
+            } else if (sparse_mode) {
+                raise("randlapack:fun_nystrom_pp_mex:exact_sparse",
+                      "lfa_type 'exact' needs the dense matrix (one-shot syevd); it is not available for sparse A");
             } else {
                 // V*diag(f(lambda))*V^T*B via a one-shot syevd. Shared implementation
                 // with the RandLAPACK test + benchmark (single point of correctness).
@@ -779,8 +904,18 @@ private:
         if (vector_mode) {
             linops::DiagSymLinOp<T> A_op(n, A_buf);
             drive_tiers(A_op);
+        } else if (sparse_mode) {
+            if constexpr (std::is_same_v<T, double>) {
+                using CSC = RandBLAS::sparse_data::CSCMatrix<double, int64_t>;
+                CSC A_csc(n, n, sp_nnz, sp_vals.get(), sp_rowidx.get(), sp_colptr.get());
+                linops::SparseSymLinOp<double, CSC> A_op(A_csc);
+                drive_tiers(A_op);
+            } else {
+                raise("randlapack:fun_nystrom_pp_mex:A_sparse_single", "sparse A is double only");
+            }
         } else {
             linops::ExplicitSymLinOp<T> A_op(n, blas::Uplo::Upper, A_buf, n, Layout::ColMajor);
+            A_op.both_triangles = true;   // A_buf is a copy of MATLAB's full symmetric matrix
             drive_tiers(A_op);
         }
 
@@ -1008,20 +1143,26 @@ public:
             // single/double. Vector mode never forms the n x n matrix. ---
             const Array& A_in = inputs[0];
             auto A_dims = A_in.getDimensions();
-            const bool vector_mode = (A_dims.size() == 2) &&
+            if (A_in.getType() == ArrayType::SPARSE_DOUBLE) {
+                raise("randlapack:fun_nystrom_pp_mex:A_sparse_raw",
+                      "pass sparse A through randlapack.fun_nystrom_pp, which hands the MEX its compressed-column arrays "
+                      "(reading a MATLAB sparse array element by element here costs O(n) per nonzero)");
+            }
+            const bool sparse_in = is_sparse_struct(A_in);
+            const bool vector_mode = !sparse_in && (A_dims.size() == 2) &&
                 ((A_dims[0] == 1 && A_dims[1] > 1) || (A_dims[1] == 1 && A_dims[0] > 1));
-            if (A_dims.size() != 2 || (!vector_mode && A_dims[0] != A_dims[1])) {
+            if (!sparse_in && (A_dims.size() != 2 || (!vector_mode && A_dims[0] != A_dims[1]))) {
                 raise("randlapack:fun_nystrom_pp_mex:A_shape",
                       "A must be a square n x n matrix or an n-vector of diagonal entries");
             }
-            const ArrayType A_type = A_in.getType();
+            const ArrayType A_type = sparse_in ? ArrayType::DOUBLE : A_in.getType();
             if (A_type != ArrayType::DOUBLE && A_type != ArrayType::SINGLE) {
                 raise("randlapack:fun_nystrom_pp_mex:A_dtype",
-                      "A must be single or double precision");
+                      "A must be single or double precision, or a sparse double matrix");
             }
             // A_dims[0] is 1 for a row vector, so numel is the only safe read.
-            const int64_t n = vector_mode
-                ? static_cast<int64_t>(A_in.getNumberOfElements())
+            const int64_t n = sparse_in ? sparse_n_of(A_in)
+                : vector_mode ? static_cast<int64_t>(A_in.getNumberOfElements())
                 : static_cast<int64_t>(A_dims[0]);
 
             // --- arg 2 (Phase-1): scalar k only. The Phase-1 sketch is a SASO

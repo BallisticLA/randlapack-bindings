@@ -10,7 +10,8 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %   est = randlapack.fun_nystrom_pp(A, k, Omega2, ...)   % explicit Phase-2 probes
 %   [est, t1, t2, times] = randlapack.fun_nystrom_pp(...)
 %       the 4th output is a wall-clock instrumentation struct (fields:
-%       marshal_in_ms, phase1_ms, phase2_ms, fafun_ms, assembly_ms,
+%       marshal_in_ms (for sparse A including the wrapper's compressed-column
+%       conversion), phase1_ms, phase2_ms, fafun_ms, assembly_ms,
 %       specrec_ms, nystrom_us (1x11; only slots 1,2,3,7,11 populated, slot 7
 %       = the whole spectral-recovery block), lfa_us (1x6; slot 6 = reorth
 %       time, real for scalar/block/block_qfa, 0 for the basis-free
@@ -191,9 +192,10 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 %                   times record the request and any pilot/final fallback.
 %     'AdaptiveMatvecCap' LFAType 'adaptive' only: optional total matvec cap
 %                   (default 0 = no cap). Ignored by every other LFAType.
-%     'Sketch'      Compatibility option: only 'saso' is supported. The Phase-1 sketch is
-%                   always the kernel-internal SASO. Other values are rejected
-%                   before calling MEX because they do not select another sketch.
+%     'Sketch'      'saso' (default): the kernel-internal sparse SASO (density VecNnz).
+%                   'gaussian': a dense Gaussian sketch applied by ordinary matrix
+%                   products (comparison series; VecNnz is ignored). Other values are
+%                   rejected before calling MEX.
 %     'VecNnz'      nonzeros per ROW of the SASO sketch (default 8;
 %                   0 = auto, resolved to ~log(k) inside the kernel)
 %     'SketchSeed'  RNG seed for the Phase-1 sketch (default 42)
@@ -220,10 +222,16 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     % 'square' attribute would reject the vector, so the shape is checked here
     % instead; 'numel' is the only safe size read (size(A,1) is 1 for a row
     % vector).
-    validateattributes(A, {'single', 'double'}, ...
-                       {'2d', 'real', 'finite', 'nonsparse'}, ...
-                       mfilename, 'A', 1);
-    vector_mode = isvector(A) && ~isscalar(A);
+    % Sparse A (double; MATLAB has no sparse single) must hold BOTH triangles: the MEX applies the whole matrix with
+    % RandBLAS sparse products and never infers a triangle.
+    if issparse(A)
+        validateattributes(A, {'double'}, {'2d', 'real', 'finite'}, mfilename, 'A', 1);
+    else
+        validateattributes(A, {'single', 'double'}, ...
+                           {'2d', 'real', 'finite', 'nonsparse'}, ...
+                           mfilename, 'A', 1);
+    end
+    vector_mode = ~issparse(A) && isvector(A) && ~isscalar(A);
     if ~vector_mode && size(A, 1) ~= size(A, 2)
         error('randlapack:fun_nystrom_pp:A_shape', ...
               ['A must be a square n x n matrix or an n-vector of diagonal ' ...
@@ -326,10 +334,10 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     q        = double(p.Results.Q);
     pl       = double(p.Results.PolyLambda);
     lfa_type = char(p.Results.LFAType);
-    sketch   = char(p.Results.Sketch);
-    if ~strcmpi(sketch,'saso')
+    sketch   = lower(char(p.Results.Sketch));
+    if ~any(strcmpi(sketch,{'saso','gaussian'}))
         error('randlapack:fun_nystrom_pp:unsupportedSketch', ...
-            ['Only the internally generated SASO sketch is supported. ' ...
+            ['Sketch must be ''saso'' (sparse, default) or ''gaussian'' (dense, for comparison). ' ...
              'Use VecNnz to change its density; other Sketch values previously had no effect.']);
     end
     vec_nnz  = double(p.Results.VecNnz);
@@ -442,8 +450,13 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     % bypassed outright there rather than through SkipSymCheck.
     if ~skip_sym_check && ~vector_mode
         A_diff = A - A.';
-        asym   = max(abs(A_diff(:)));
-        ascale = max(abs(A(:)));
+        if issparse(A)   % on the nonzeros: A(:) of a large sparse A would be an n^2-row vector
+            asym   = max([0; abs(nonzeros(A_diff))]);
+            ascale = max([0; abs(nonzeros(A))]);
+        else
+            asym   = max(abs(A_diff(:)));
+            ascale = max(abs(A(:)));
+        end
         if ascale == 0, ascale = 1; end
         sym_tol = sqrt(eps(cls));
         if asym > sym_tol * ascale
@@ -462,6 +475,19 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
 
     % A is templated on by the MEX; keep it in the working precision.
     A = cast(A, cls);
+    % Sparse A goes to the MEX as zero-based compressed-column arrays: find() returns the nonzeros column by column with
+    % rows ascending (CSC order) in O(nnz). The MEX cannot read a MATLAB sparse array's own buffers, and walking it element
+    % by element there costs O(n) per nonzero.
+    csc_ms = 0;
+    if issparse(A)
+        csc_timer = tic;
+        [ri, ci, vv] = find(A);
+        cnt = accumarray(ci(:), 1, [size(A, 2), 1]);
+        A = struct('sparse_n', int64(size(A, 1)), 'colptr', int64([0; cumsum(cnt)]), ...
+                   'rowidx', int64(ri(:) - 1), 'vals', double(vv(:)));
+        clear ri ci vv cnt
+        csc_ms = 1000 * toc(csc_timer);
+    end
 
     mex_args = {A, a1, a2, func, q, pl, lfa_type, d, ...
                 sketch, vec_nnz, sk_seed, reorth, adaptive, adapt_tol, ...
@@ -479,5 +505,7 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
         [est, t1, t2] = fun_nystrom_pp_mex(mex_args{:});
     else
         [est, t1, t2, times] = fun_nystrom_pp_mex(mex_args{:});
+        % The compressed-column conversion is part of getting a sparse A into the MEX.
+        times.marshal_in_ms = times.marshal_in_ms + csc_ms;
     end
 end
