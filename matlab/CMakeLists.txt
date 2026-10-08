@@ -51,6 +51,21 @@ target_link_options(bqrrp_mex PRIVATE ${MEX_STATIC_LIBSTDCXX_FLAGS})
 # no-op off Windows and only exists in RandLAPACK installs that export it.
 if(COMMAND randlapack_stage_runtime_dlls)
     randlapack_stage_runtime_dlls(bqrrp_mex)
+    # Never leave Intel's OpenMP runtime, libiomp5md.dll, beside the MEX.
+    # MATLAB already hosts it, and a second copy loaded from this directory
+    # aborts with OMP Error #15 at the first parallel region; this happens
+    # when the BLAS backend is threaded through Intel OpenMP and the RandLAPACK
+    # install records that runtime's directory among the DLL directories to
+    # stage. Without the copy, the backend binds to MATLAB's runtime. CMake
+    # runs a target's POST_BUILD commands in the order they are added (every
+    # generator does; the docs promise order only within one call), so this
+    # follows the staging.
+    if(WIN32)
+        add_custom_command(TARGET bqrrp_mex POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E rm -f
+                    $<TARGET_FILE_DIR:bqrrp_mex>/libiomp5md.dll
+            VERBATIM)
+    endif()
 endif()
 
 # Windows (MSVC): MATLAB's process already hosts Intel's OpenMP runtime
@@ -62,11 +77,13 @@ endif()
 # import library (shipped in bin/win64 for exactly this purpose) and drop the
 # compiler's default runtime (libompd.lib is its /MDd variant). MATLAB's
 # runtime lacks some newer entry points (e.g. the ones MSVC emits for
-# collapse, used in rl_rpchol.hh); code that needs them then fails to link
-# instead of silently loading the second runtime. Plain
-# target_link_libraries form, matching FindMatlab's internal usage
-# (keyword/plain forms cannot mix). Guarded on MSVC, not WIN32: these are
-# MSVC linker flags, and MinGW builds use their own OpenMP runtime.
+# collapse, used in rl_rpchol.hh); code that needs them then fails to link,
+# or, when a threaded BLAS++ brings Intel's newer import library, fails to
+# load ("The specified procedure could not be found"), instead of silently
+# loading a second runtime. Plain target_link_libraries form, matching
+# FindMatlab's internal usage (keyword/plain forms cannot mix). Guarded on
+# MSVC, not WIN32: these are MSVC linker flags, and MinGW builds use their own
+# OpenMP runtime.
 if(MSVC)
     target_link_libraries(bqrrp_mex "${Matlab_ROOT_DIR}/bin/win64/libiomp5md.lib")
     target_link_options(bqrrp_mex PRIVATE

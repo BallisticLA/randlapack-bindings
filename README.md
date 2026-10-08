@@ -39,7 +39,7 @@ cmake --build build
 
 `-G Ninja` is required: the default Visual Studio generator appends a `Debug\` or `Release\` subdirectory to the MEX output path, where MATLAB's package loader never looks.
 
-The build copies the BLAS++ and LAPACK++ DLLs and every DLL in the BLAS backend's `bin` directory next to the MEX, so MATLAB needs no `PATH` changes. For oneMKL that is about 1 GB. The backend directory comes from the RandLAPACK install, which records it when built by `install.ps1`; for a RandLAPACK you configured yourself, pass `-DRANDLAPACK_RUNTIME_DLL_DIRS=<backend bin directory>`, or the MEX fails to load with "The specified module could not be found".
+The build copies the BLAS++ and LAPACK++ DLLs and every DLL in the BLAS backend's `bin` directory next to the MEX (except Intel's OpenMP runtime; see Runtime notes), so MATLAB needs no `PATH` changes. For oneMKL that is about 1 GB. The backend directory comes from the RandLAPACK install, which records it when built by `install.ps1`; for a RandLAPACK you configured yourself, pass `-DRANDLAPACK_RUNTIME_DLL_DIRS=<backend bin directory>`, or the MEX fails to load with "The specified module could not be found".
 
 If you built BLAS++ and LAPACK++ as static libraries yourself, your RandLAPACK install must include BallisticLA/RandLAPACK#199 (reinstall from current `main`); with an older install this build fails at the DLL-copy step.
 
@@ -72,7 +72,7 @@ LD_PRELOAD=/usr/lib/x86_64-linux-gnu/libstdc++.so.6 matlab
 
 Alias it in your shell profile to make it transparent. Not needed on macOS or older Ubuntu hosts.
 
-On **Windows**, the MEX uses MATLAB's own OpenMP runtime (`libiomp5md`) instead of MSVC's, because two OpenMP runtimes in one process abort with `OMP: Error #15`. Do not set `KMP_DUPLICATE_LIB_OK=TRUE` to get past that error: the error message itself calls it an unsafe, unsupported workaround that may cause crashes or silently produce incorrect results. If you see Error #15, close MATLAB (Windows locks a loaded MEX file) and rebuild the MEX from the current bindings.
+On **Windows**, the MEX uses MATLAB's own OpenMP runtime (`libiomp5md`) instead of MSVC's, because two OpenMP runtimes in one process abort with `OMP: Error #15`. For the same reason the build never leaves a `libiomp5md.dll` next to the MEX, even when the BLAS backend uses Intel's OpenMP (threaded oneMKL does): the backend then runs on MATLAB's copy. Do not set `KMP_DUPLICATE_LIB_OK=TRUE` to get past that error: the error message itself calls it an unsafe, unsupported workaround that may cause crashes or silently produce incorrect results. If you see Error #15, close MATLAB (Windows locks a loaded MEX file) and rebuild the MEX from the current bindings.
 
 ## Conventions
 
