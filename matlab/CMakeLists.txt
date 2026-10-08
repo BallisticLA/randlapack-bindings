@@ -12,7 +12,7 @@ file(MAKE_DIRECTORY ${MEX_OUTPUT_DIR})
 # symbols required by code built with GCC 13+. Statically linking avoids
 # the runtime dependency entirely -- the MEX file ships its own libstdc++
 # symbols and is loadable in any MATLAB without LD_PRELOAD gymnastics.
-# Applied via target_link_options on each matlab_add_mex target below.
+# Applied via target_link_options in randlapack_add_mex below.
 #
 # These are GCC/Linux-only flags. AppleClang on macOS rejects -static-libgcc
 # ("unsupported option"): there is no libgcc to statically link (macOS uses
@@ -24,68 +24,89 @@ else()
     set(MEX_STATIC_LIBSTDCXX_FLAGS "")
 endif()
 
-matlab_add_mex(
-    NAME bqrrp_mex
-    SRC src/bqrrp_mex.cc
-    LINK_TO RandLAPACK::RandLAPACK
-    R2018a
-)
-# matlab_add_mex's LINK_TO doesn't propagate INTERFACE_INCLUDE_DIRECTORIES from
-# the linked targets in all CMake versions. Expose them explicitly. We use
-# target_include_directories (not a second target_link_libraries) because
-# FindMatlab itself uses the plain (no-keyword) target_link_libraries form
-# internally and CMake disallows mixing keyword/plain calls on one target.
-target_include_directories(bqrrp_mex PRIVATE
-    $<TARGET_PROPERTY:RandLAPACK::RandLAPACK,INTERFACE_INCLUDE_DIRECTORIES>
-)
-set_target_properties(bqrrp_mex PROPERTIES
-    LIBRARY_OUTPUT_DIRECTORY ${MEX_OUTPUT_DIR}
-    RUNTIME_OUTPUT_DIRECTORY ${MEX_OUTPUT_DIR}
-)
-target_compile_features(bqrrp_mex PRIVATE cxx_std_20)
-target_link_options(bqrrp_mex PRIVATE ${MEX_STATIC_LIBSTDCXX_FLAGS})
-# Windows: stage the BLAS backend's runtime DLLs next to the MEX. MATLAB loads
-# a MEX with the MEX file's own directory on the DLL search path, so app-local
-# staging (the idiomatic Windows layout RandLAPACK's installer uses for its own
-# executables) makes the MEX loadable without PATH edits. The helper is a
-# no-op off Windows and only exists in RandLAPACK installs that export it.
-if(COMMAND randlapack_stage_runtime_dlls)
-    randlapack_stage_runtime_dlls(bqrrp_mex)
-    # Never leave Intel's OpenMP runtime, libiomp5md.dll, beside the MEX.
-    # MATLAB already hosts it, and a second copy loaded from this directory
-    # aborts with OMP Error #15 at the first parallel region; this happens
-    # when the BLAS backend is threaded through Intel OpenMP and the RandLAPACK
-    # install records that runtime's directory among the DLL directories to
-    # stage. Without the copy, the backend binds to MATLAB's runtime. CMake
-    # runs a target's POST_BUILD commands in the order they are added (every
-    # generator does; the docs promise order only within one call), so this
-    # follows the staging.
-    if(WIN32)
-        add_custom_command(TARGET bqrrp_mex POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E rm -f
-                    $<TARGET_FILE_DIR:bqrrp_mex>/libiomp5md.dll
-            VERBATIM)
-    endif()
-endif()
+# Defines one MEX target, built from src/<name>.cc, with everything every
+# target here needs. Each driver gets one call at the bottom of this file.
+function(randlapack_add_mex name)
+    matlab_add_mex(
+        NAME ${name}
+        SRC src/${name}.cc
+        LINK_TO RandLAPACK::RandLAPACK
+        R2018a
+    )
+    # matlab_add_mex's LINK_TO doesn't propagate INTERFACE_INCLUDE_DIRECTORIES
+    # from the linked targets in all CMake versions. Expose them explicitly. We
+    # use target_include_directories (not a second target_link_libraries)
+    # because FindMatlab itself uses the plain (no-keyword)
+    # target_link_libraries form internally and CMake disallows mixing
+    # keyword/plain calls on one target.
+    target_include_directories(${name} PRIVATE
+        $<TARGET_PROPERTY:RandLAPACK::RandLAPACK,INTERFACE_INCLUDE_DIRECTORIES>
+    )
+    set_target_properties(${name} PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${MEX_OUTPUT_DIR}
+        RUNTIME_OUTPUT_DIRECTORY ${MEX_OUTPUT_DIR}
+    )
+    target_compile_features(${name} PRIVATE cxx_std_20)
+    target_link_options(${name} PRIVATE ${MEX_STATIC_LIBSTDCXX_FLAGS})
 
-# Windows (MSVC): MATLAB's process already hosts Intel's OpenMP runtime
-# (libiomp5md), while code compiled with /openmp:llvm requests MSVC's runtime
-# (default library libomp.lib, which loads libomp140.x86_64.dll); two OpenMP
-# runtimes in one process abort at the first parallel region (OMP Error #15).
-# Intel's runtime and LLVM's share the kmpc entry points (LLVM's libomp
-# descends from Intel's), so resolve the OpenMP references from MATLAB's own
-# import library (shipped in bin/win64 for exactly this purpose) and drop the
-# compiler's default runtime (libompd.lib is its /MDd variant). MATLAB's
-# runtime lacks some newer entry points (e.g. the ones MSVC emits for
-# collapse, used in rl_rpchol.hh); code that needs them then fails to link,
-# or, when a threaded BLAS++ brings Intel's newer import library, fails to
-# load ("The specified procedure could not be found"), instead of silently
-# loading a second runtime. Plain target_link_libraries form, matching
-# FindMatlab's internal usage (keyword/plain forms cannot mix). Guarded on
-# MSVC, not WIN32: these are MSVC linker flags, and MinGW builds use their own
-# OpenMP runtime.
-if(MSVC)
-    target_link_libraries(bqrrp_mex "${Matlab_ROOT_DIR}/bin/win64/libiomp5md.lib")
-    target_link_options(bqrrp_mex PRIVATE
-        "/nodefaultlib:libomp.lib" "/nodefaultlib:libompd.lib")
-endif()
+    # Windows: stage the BLAS backend's runtime DLLs next to the MEX. MATLAB
+    # loads a MEX with the MEX file's own directory on the DLL search path, so
+    # app-local staging (the idiomatic Windows layout RandLAPACK's installer
+    # uses for its own executables) makes the MEX loadable without PATH edits.
+    # The helper is a no-op off Windows and only exists in RandLAPACK installs
+    # that export it.
+    if(COMMAND randlapack_stage_runtime_dlls)
+        randlapack_stage_runtime_dlls(${name})
+        # Never leave Intel's OpenMP runtime, libiomp5md.dll, beside the MEX.
+        # MATLAB already hosts it, and a second copy loaded from this directory
+        # aborts with OMP Error #15 at the first parallel region; this happens
+        # when the BLAS backend is threaded through Intel OpenMP and the
+        # RandLAPACK install records that runtime's directory among the DLL
+        # directories to stage. Without the copy, the backend binds to MATLAB's
+        # runtime. CMake runs a target's POST_BUILD commands in the order they
+        # are added (every generator does; the docs promise order only within
+        # one call), so this follows the staging.
+        if(WIN32)
+            add_custom_command(TARGET ${name} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E rm -f
+                        $<TARGET_FILE_DIR:${name}>/libiomp5md.dll
+                VERBATIM)
+            # Every MEX target stages the same DLL set (about 1 GB for
+            # oneMKL) into the same directory. Run in parallel, two targets'
+            # copies, or one target's copy and another's removal above, can
+            # reach the same file at once and fail with a sharing violation,
+            # so each MEX target waits for the one defined before it.
+            get_property(previous_mex GLOBAL PROPERTY RANDLAPACK_BINDINGS_LAST_MEX)
+            if(previous_mex)
+                add_dependencies(${name} ${previous_mex})
+            endif()
+            set_property(GLOBAL PROPERTY RANDLAPACK_BINDINGS_LAST_MEX ${name})
+        endif()
+    endif()
+
+    # Windows (MSVC): MATLAB's process already hosts Intel's OpenMP runtime
+    # (libiomp5md), while code compiled with /openmp:llvm requests MSVC's
+    # runtime (default library libomp.lib, which loads libomp140.x86_64.dll);
+    # two OpenMP runtimes in one process abort at the first parallel region
+    # (OMP Error #15). Intel's runtime and LLVM's share the kmpc entry points
+    # (LLVM's libomp descends from Intel's), so resolve the OpenMP references
+    # from MATLAB's own import library (shipped in bin/win64 for exactly this
+    # purpose) and drop the compiler's default runtime (libompd.lib is its
+    # /MDd variant). MATLAB's runtime lacks some newer entry points (e.g. the
+    # ones MSVC emits for collapse, used in rl_rpchol.hh); code that needs them
+    # then fails to link, or, when a threaded BLAS++ brings Intel's newer
+    # import library, fails to load ("The specified procedure could not be
+    # found"), instead of silently loading a second runtime. Plain
+    # target_link_libraries form, matching FindMatlab's internal usage
+    # (keyword/plain forms cannot mix). Guarded on MSVC, not WIN32: these are
+    # MSVC linker flags, and MinGW builds use their own OpenMP runtime.
+    if(MSVC)
+        target_link_libraries(${name} "${Matlab_ROOT_DIR}/bin/win64/libiomp5md.lib")
+        target_link_options(${name} PRIVATE
+            "/nodefaultlib:libomp.lib" "/nodefaultlib:libompd.lib")
+    endif()
+endfunction()
+
+randlapack_add_mex(bqrrp_mex)
+randlapack_add_mex(cqrrpt_mex)
+randlapack_add_mex(cqrrt_mex)

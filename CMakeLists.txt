@@ -38,5 +38,5 @@ else()
         "Set -DMatlab_ROOT_DIR=/path/to/MATLAB to enable. "
         "The +randlapack package can still be used by adding "
         "${CMAKE_CURRENT_SOURCE_DIR}/matlab to the MATLAB path, "
-        "but calls into bqrrp_mex will fail until the MEX is built.")
+        "but calls into the MEX files will fail until they are built.")
 endif()

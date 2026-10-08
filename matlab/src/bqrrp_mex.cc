@@ -284,9 +284,18 @@ public:
             raise("randlapack:bqrrp_mex:RandLAPACKError", e.what());
         } catch (const RandBLAS::Error& e) {
             raise("randlapack:bqrrp_mex:RandBLASError", e.what());
+        } catch (const matlab::engine::Exception&) {
+            // Errors raised by this MEX (raise() calls feval("error"), which
+            // throws matlab::engine::MATLABException) and other MATLAB engine
+            // errors propagate unchanged, so MATLAB sees the original error ID
+            // and message. In the MEX API (cppmex/mexException.hpp) these
+            // derive from std::exception but not from matlab::Exception (the
+            // C++ Engine API's classes of the same name differ): without this
+            // handler, the std::exception one below would re-raise them as
+            // ...:StdError.
+            throw;
         } catch (const matlab::Exception&) {
-            // MATLAB exceptions (typically from feval(error)) propagate through
-            // unchanged so MATLAB sees the original error ID and message.
+            // MATLAB Data API exceptions propagate unchanged.
             throw;
         } catch (const std::exception& e) {
             raise("randlapack:bqrrp_mex:StdError", e.what());
