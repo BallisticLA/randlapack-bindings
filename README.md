@@ -4,7 +4,13 @@ MATLAB, and eventually Python, bindings for [RandLAPACK](https://github.com/Ball
 
 ## Scope (v0)
 
-Proof-of-concept binding for a single driver, `BQRRP` (randomized blocked QR with column pivoting), in single and double precision, real matrices, column-major. More drivers as their C++ APIs stabilize. Python next.
+MATLAB bindings for three QR drivers, in single and double precision, real matrices, column-major:
+
+* `BQRRP`: randomized blocked QR with column pivoting, any shape.
+* `CQRRPT`: randomized rank-revealing QR with column pivoting, for tall matrices.
+* `CQRRT`: randomized Cholesky QR without pivoting, for tall full-rank matrices.
+
+More drivers as their C++ APIs stabilize. Python next.
 
 ## Requirements
 
@@ -24,7 +30,7 @@ cmake --build build -j
 
 Pass `-DCMAKE_BUILD_TYPE=Release`: without a build type the MEX compiles without optimization (Ninja with MSVC even defaults to Debug).
 
-If MATLAB is not found, MEX targets are skipped with a clear warning; the `.m` files still ship and can be used once the MEX is built. On success, `matlab/+randlapack/private/bqrrp_mex.<ext>` is in place.
+If MATLAB is not found, MEX targets are skipped with a clear warning; the `.m` files still ship and can be used once the MEX is built. On success, `bqrrp_mex.<ext>`, `cqrrpt_mex.<ext>` and `cqrrt_mex.<ext>` are in `matlab/+randlapack/private/`.
 
 ### Windows
 
@@ -56,11 +62,28 @@ err = norm(A(:, J) - Q*R, 'fro') / norm(A, 'fro');
 Two output modes, chosen by a trailing string (qr-style):
 
 ```matlab
-[Q, R, J]       = randlapack.bqrrp(A, 'explicit')  % default; matches qr(A, 'vector')
+[Q, R, J]       = randlapack.bqrrp(A, 'explicit')  % default; matches qr(A, 'econ', 'vector')
 [A_out, tau, J] = randlapack.bqrrp(A, 'implicit')  % GEQP3-format; skips Q materialization
 ```
 
 Run `help randlapack.bqrrp` for the full signature, including the optional `b_sz`, `d_factor`, and RNG `state` arguments.
+
+For **tall** matrices (`m >= d_factor*n`, with `d_factor = 1.25` by default), two sketch-and-precondition drivers:
+
+```matlab
+A = randn(20000, 200);
+
+% CQRRPT: rank-revealing, pivoted. The detected rank is size(R, 1).
+[Q, R, J] = randlapack.cqrrpt(A);
+err = norm(A(:, J) - Q*R, 'fro') / norm(A, 'fro');
+
+% CQRRT: unpivoted, for full-rank A. Same layout as qr(A, 0).
+[Q, R] = randlapack.cqrrt(A);
+err = norm(A - Q*R, 'fro') / norm(A, 'fro');
+R = randlapack.cqrrt(A);                 % R only: Q is not formed
+```
+
+CQRRT does not detect rank: on a rank-deficient input it usually returns without error, with a numerically singular R (it stops with an error only on an exactly singular sketch, e.g. a zero column, or a Cholesky failure). If the rank is uncertain, check `abs(diag(R))` or use `randlapack.cqrrpt`. Both take `'d_factor'` and `'state'` name-value options (CQRRPT also `'eps'`); see `help randlapack.cqrrpt` and `help randlapack.cqrrt`.
 
 ## Runtime notes
 
@@ -76,5 +99,5 @@ On **Windows**, the MEX uses MATLAB's own OpenMP runtime (`libiomp5md`) instead 
 
 ## Conventions
 
-* `J` is **1-based**, matching MATLAB. BQRRP stores 1-based pivots natively; no conversion in the MEX layer.
+* `J` is **1-based**, matching MATLAB. BQRRP and CQRRPT store 1-based pivots natively; no conversion in the MEX layer.
 * RNG `state` is Philox4x32: `state.counter` is `uint32[4]`, `state.key` is `uint32[2]`. Omit it (defaults to seed 0) or pass a scalar `uint32` seed.
