@@ -1,4 +1,10 @@
-cmake_minimum_required(VERSION 3.20)
+# 3.21 matches RandLAPACK's own floor. It also sets policy CMP0126 to NEW,
+# which older RandLAPACK installs need on Windows: their package file sets
+# RANDLAPACK_RUNTIME_DLL_DIRS to the recorded BLAS backend DLL directories and
+# then declares the same name as an empty cache variable, which under OLD
+# deletes the recorded value on a fresh configure, so the backend DLLs are not
+# staged beside the MEX.
+cmake_minimum_required(VERSION 3.21)
 project(randlapack-bindings VERSION 0.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
