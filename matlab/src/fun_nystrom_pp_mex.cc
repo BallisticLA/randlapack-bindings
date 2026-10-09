@@ -110,7 +110,10 @@
 //   t1          Phase 1 contribution (scalar double)
 //   t2          Phase 2 contribution (scalar double; 0 when k == n)
 //   times       (optional 4th output) struct of wall-clock instrumentation:
-//                 marshal_in_ms  copying A/Omega1/Omega2 out of MATLAB arrays
+//                 marshal_in_ms  reading A/Omega2 out of MATLAB arrays: validation only by default (the
+//                                driver reads MATLAB's buffers in place), plus the private copy when
+//                                RANDLAPACK_FNPP_COPY_INPUT=1
+//                 input_copied   true when that private copy was made (see copy_input_requested)
 //                 phase1_ms      NystromEVD total (driver field)
 //                 phase2_ms      Phase 2 total (driver field)
 //                 fafun_ms       time inside the f(A)*X oracle (subset of phase2)
@@ -351,6 +354,7 @@ private:
     std::unique_ptr<T[]> copy_into(const Array& in, size_t n_elems) {
         std::unique_ptr<T[]> out(new T[n_elems]);
         const TypedArray<T> typed = in;
+        if (n_elems == 0) return out;
         // Opt-in performance switch, off by default: RANDLAPACK_PERF_PARCOPY=1 splits the copy over
         // threads. A fresh buffer's pages land on the memory node of the thread that first writes them, so a
         // one-thread memcpy puts the whole matrix on one node and every later product streams it from there.
@@ -383,6 +387,49 @@ private:
         }
         std::memcpy(out.get(), &*typed.cbegin(), n_elems * sizeof(T));
         return out;
+    }
+
+    // Zero-copy input (the default): the address of MATLAB's own column-major buffer, read in place. The const
+    // TypedArray selects the const iterator, so MATLAB's copy-on-write never unshares the array (see copy_into).
+    // The temporary TypedArray shares the buffer with `in`, which is an element of the MEX's ArgumentList and
+    // keeps the data alive for the whole call, so the pointer stays valid after `typed` goes out of scope.
+    // Every consumer reads A through const T*: ExplicitSymLinOp::A_buff, DiagSymLinOp::lambda,
+    // make_exact_fa_oracle (which copies before its destructive syevd) and FunNystromPP::call's Omega2; there is
+    // no const_cast or pointer cast anywhere on those paths (RandLAPACK fc4423e, RandBLAS 86ed633), so a write
+    // into MATLAB's array would not compile. The read-only proof is in the 2026-10-07 memopt report.
+    template <typename T>
+    static const T* matlab_data(const Array& in) {
+        const TypedArray<T> typed = in;
+        if (typed.getNumberOfElements() == 0) return nullptr;
+        return &*typed.cbegin();
+    }
+
+    // Input marshalling: RANDLAPACK_FNPP_COPY_INPUT=1 restores the private copy of A, Omega2 and the sparse CSC arrays
+    // (the code the paper ran; RANDLAPACK_PERF_PARCOPY=1 still threads that copy). Off by default: the MEX reads
+    // MATLAB's buffers in place, so a dense n x n problem holds one copy of A instead of two. Builds without
+    // RANDLAPACK_SYMMETRIC_SKETCH mirror the upper triangle into the buffer and therefore always copy.
+    static bool copy_input_requested() {
+#ifndef RANDLAPACK_SYMMETRIC_SKETCH
+        return true;
+#else
+        const char* v = std::getenv("RANDLAPACK_FNPP_COPY_INPUT");
+        return v != nullptr && v[0] == '1';
+#endif
+    }
+
+    // RANDLAPACK_PERF_PARCOPY=1 threads the private copy; without the copy it has nothing to do. Scripts from before
+    // 2026-10-07 set it to get a spread copy, so say once per MATLAB session (per MEX load) that it no longer applies:
+    // placement is now the caller's job (harness utils/numa_place.m, randlapack.numa_spread / load_dense).
+    void warn_parcopy_unused_once() {
+        static bool warned = false;
+        const char* pc = std::getenv("RANDLAPACK_PERF_PARCOPY");
+        if (warned || pc == nullptr || pc[0] != '1') return;
+        warned = true;
+        matlabPtr->feval(u"warning", 0, std::vector<Array>{
+            factory.createCharArray("randlapack:fun_nystrom_pp_mex:parcopyUnused"),
+            factory.createCharArray("RANDLAPACK_PERF_PARCOPY=1 has no effect: the MEX reads MATLAB's input arrays in place "
+                                    "(no copy to thread). For a dense A, spread its pages with randlapack.numa_spread "
+                                    "or load_dense; RANDLAPACK_FNPP_COPY_INPUT=1 restores the threaded private copy.")});
     }
 
     // Sparse A reaches the MEX from the wrapper as a 1x1 struct of zero-based compressed-column arrays: sparse_n (int64
@@ -419,11 +466,19 @@ private:
         return nA[0];
     }
 
-    // Copies and validates the struct's arrays: colptr starts at 0, never decreases and ends at nnz; every row index is
-    // in [0, n) and rows strictly increase within a column (the order element access and the sparse kernels rely on);
-    // every value is finite.
-    void copy_csc(const Array& in, int64_t n, std::unique_ptr<int64_t[]>& colptr, std::unique_ptr<int64_t[]>& rowidx,
-                  std::unique_ptr<double[]>& vals, int64_t& nnz) {
+    // Validates the struct's arrays, then either copies them (copy == true) or points at MATLAB's own buffers: colptr
+    // starts at 0, never decreases and ends at nnz; every row index is in [0, n) and rows strictly increase within a
+    // column (the order element access and the sparse kernels rely on); every value is finite. The checks read the
+    // MATLAB arrays in place, so a refused matrix costs no copy. The zero-copy pointers are const, but the CSCMatrix
+    // built from them (a non-owning view, own_memory = false) stores plain T* / int64_t* members, so const SpMat& does
+    // NOT protect them: the sparse path is read-only by inspection, not by type. On this path RandBLAS's left_spmm /
+    // right_spmm, its CSC kernels and its sparse-times-sparse sketch only read the arrays; the MKL backend wraps them
+    // in mkl_sparse_?_create_csc handles for mkl_sparse_?_mm / _spmmd, which leave them unchanged; RandBLAS never calls
+    // mkl_sparse_order or reindex_inplace (RandBLAS 86ed633). Through randlapack.fun_nystrom_pp the arrays are fresh
+    // find() temporaries in any case, so a caller's sparse A could not be reached.
+    void marshal_csc(const Array& in, int64_t n, bool copy, std::unique_ptr<int64_t[]>& colptr_own,
+                     std::unique_ptr<int64_t[]>& rowidx_own, std::unique_ptr<double[]>& vals_own,
+                     const int64_t*& colptr, const int64_t*& rowidx, const double*& vals, int64_t& nnz) {
         const TypedArray<int64_t> cp = sparse_field(in, "colptr", ArrayType::INT64);
         const TypedArray<int64_t> ri = sparse_field(in, "rowidx", ArrayType::INT64);
         const TypedArray<double>  vv = sparse_field(in, "vals",   ArrayType::DOUBLE);
@@ -432,14 +487,29 @@ private:
             raise("randlapack:fun_nystrom_pp_mex:A_sparse_colptr", "sparse A: colptr must have n+1 entries");
         if (static_cast<int64_t>(vv.getNumberOfElements()) != nnz)
             raise("randlapack:fun_nystrom_pp_mex:A_sparse_nnz", "sparse A: rowidx and vals must have the same length");
-        colptr.reset(new int64_t[n + 1]);
-        rowidx.reset(new int64_t[std::max<int64_t>(nnz, 1)]);
-        vals.reset(new double[std::max<int64_t>(nnz, 1)]);
-        std::memcpy(colptr.get(), &*cp.cbegin(), static_cast<size_t>(n + 1) * sizeof(int64_t));
-        if (nnz > 0) {
-            std::memcpy(rowidx.get(), &*ri.cbegin(), static_cast<size_t>(nnz) * sizeof(int64_t));
-            std::memcpy(vals.get(), &*vv.cbegin(), static_cast<size_t>(nnz) * sizeof(double));
+        colptr = matlab_data<int64_t>(cp);
+        rowidx = matlab_data<int64_t>(ri);
+        vals   = matlab_data<double>(vv);
+        validate_csc(n, nnz, colptr, rowidx, vals);
+        if (copy) {
+            colptr_own.reset(new int64_t[n + 1]);
+            rowidx_own.reset(new int64_t[std::max<int64_t>(nnz, 1)]);
+            vals_own.reset(new double[std::max<int64_t>(nnz, 1)]);
+            std::memcpy(colptr_own.get(), colptr, static_cast<size_t>(n + 1) * sizeof(int64_t));
+            if (nnz > 0) {
+                std::memcpy(rowidx_own.get(), rowidx, static_cast<size_t>(nnz) * sizeof(int64_t));
+                std::memcpy(vals_own.get(), vals, static_cast<size_t>(nnz) * sizeof(double));
+            }
+            colptr = colptr_own.get(); rowidx = rowidx_own.get(); vals = vals_own.get();
+        } else if (nnz == 0) {
+            // An empty MATLAB array has no buffer; the kernels never dereference these when nnz == 0, but keep them
+            // non-null, as the copy path's one-element allocations are.
+            rowidx_own.reset(new int64_t[1]); vals_own.reset(new double[1]);
+            rowidx = rowidx_own.get(); vals = vals_own.get();
         }
+    }
+
+    void validate_csc(int64_t n, int64_t nnz, const int64_t* colptr, const int64_t* rowidx, const double* vals) {
         if (colptr[0] != 0 || colptr[n] != nnz)
             raise("randlapack:fun_nystrom_pp_mex:A_sparse_colptr", "sparse A: colptr must start at 0 and end at nnz");
         for (int64_t j = 0; j < n; ++j)   // all of colptr first: a decrease would merge columns in the row scan below
@@ -486,16 +556,27 @@ private:
         const int64_t n = sparse_mode ? sparse_n_of(A_in)
             : vector_mode ? static_cast<int64_t>(A_in.getNumberOfElements())
             : static_cast<int64_t>(A_dims[0]);
+        // Zero-copy by default (A_buf points into MATLAB's array); RANDLAPACK_FNPP_COPY_INPUT=1 or a legacy build
+        // copies into A_own as before.
+        const bool copy_input = copy_input_requested();
+        if (!copy_input) warn_parcopy_unused_once();
         std::unique_ptr<T[]> A_own;
-        std::unique_ptr<int64_t[]> sp_colptr, sp_rowidx;
-        std::unique_ptr<double[]> sp_vals;
+        std::unique_ptr<int64_t[]> sp_colptr_own, sp_rowidx_own;
+        std::unique_ptr<double[]> sp_vals_own;
+        const int64_t* sp_colptr = nullptr;
+        const int64_t* sp_rowidx = nullptr;
+        const double*  sp_vals   = nullptr;
         int64_t sp_nnz = 0;
+        const T* A_buf = nullptr;
         if (sparse_mode) {
-            copy_csc(A_in, n, sp_colptr, sp_rowidx, sp_vals, sp_nnz);
-        } else {
+            marshal_csc(A_in, n, copy_input, sp_colptr_own, sp_rowidx_own, sp_vals_own,
+                        sp_colptr, sp_rowidx, sp_vals, sp_nnz);
+        } else if (copy_input) {
             A_own = copy_into<T>(A_in, vector_mode ? static_cast<size_t>(n) : static_cast<size_t>(n) * n);
+            A_buf = A_own.get();
+        } else {
+            A_buf = matlab_data<T>(A_in);
         }
-        T* A_buf = A_own.get();
 
         // scalar params (read before sketch handling: internal sampling needs them)
         const std::string func        = read_string(inputs[3], "func");
@@ -633,8 +714,8 @@ private:
         const Array& O2_in = inputs[2];
         const bool phase2_skipped = (k == n);
         int64_t s = 0;
-        std::unique_ptr<T[]> O2_own;   // RAII: freed on every exit path
-        T* O2_buf = nullptr;
+        std::unique_ptr<T[]> O2_own;   // RAII: freed on every exit path (copy path only)
+        const T* O2_buf = nullptr;
         // 'auto'/'adaptive' never read Omega2/O2_buf: their driver.call
         // overloads (below) don't even take an Omega2 argument, generating
         // their own internal probes instead. Skip the marshal entirely for
@@ -662,17 +743,24 @@ private:
                           "explicit Omega2 (arg 3 matrix) must have s >= 1 "
                           "columns when k < n; got an n x 0 array");
                 }
-                O2_own = copy_into<T>(O2_in, static_cast<size_t>(n) * s);
-                O2_buf = O2_own.get();
+                // The driver reads Omega2 through const T* (FunNystromPP::call's Omega2 and every oracle's B).
+                if (copy_input) {
+                    O2_own = copy_into<T>(O2_in, static_cast<size_t>(n) * s);
+                    O2_buf = O2_own.get();
+                } else {
+                    O2_buf = matlab_data<T>(O2_in);
+                }
             }
         }
 
 #ifndef RANDLAPACK_SYMMETRIC_SKETCH
-        // The legacy general sketch product requires both triangles.
+        // The legacy general sketch product requires both triangles. Legacy builds always copy (copy_input_requested),
+        // so this writes the MEX's own buffer, never MATLAB's.
         if (!vector_mode && !sparse_mode) {
+            T* A_w = A_own.get();
             for (int64_t j = 0; j < n; ++j)
                 for (int64_t i = j + 1; i < n; ++i)
-                    A_buf[i + j * n] = A_buf[j + i * n];
+                    A_w[i + j * n] = A_w[j + i * n];
         }
 #endif
 
@@ -907,7 +995,10 @@ private:
         } else if (sparse_mode) {
             if constexpr (std::is_same_v<T, double>) {
                 using CSC = RandBLAS::sparse_data::CSCMatrix<double, int64_t>;
-                CSC A_csc(n, n, sp_nnz, sp_vals.get(), sp_rowidx.get(), sp_colptr.get());
+                // CSCMatrix's non-owning constructor takes non-const pointers; the view is only read (see marshal_csc),
+                // so dropping const here never lets a write reach MATLAB's arrays.
+                CSC A_csc(n, n, sp_nnz, const_cast<double*>(sp_vals), const_cast<int64_t*>(sp_rowidx),
+                          const_cast<int64_t*>(sp_colptr));
                 linops::SparseSymLinOp<double, CSC> A_op(A_csc);
                 drive_tiers(A_op);
             } else {
@@ -915,7 +1006,7 @@ private:
             }
         } else {
             linops::ExplicitSymLinOp<T> A_op(n, blas::Uplo::Upper, A_buf, n, Layout::ColMajor);
-            A_op.both_triangles = true;   // A_buf is a copy of MATLAB's full symmetric matrix
+            A_op.both_triangles = true;   // A_buf is MATLAB's full symmetric matrix (or, with copy_input, a copy of it)
             drive_tiers(A_op);
         }
 
@@ -1058,7 +1149,7 @@ private:
                  "probe_ms", "probe_converged", "phase2_certified",
                  "first_row_ql_requested", "first_row_ql_fallback", "symmetric_sketch",
                  "ritz_clamped", "rank_deficient_steps", "min_diag_ratio",
-                 "nystrom_clamped", "bracket_evaluated", "phase2_checked"});
+                 "nystrom_clamped", "bracket_evaluated", "phase2_checked", "input_copied"});
             ts[0]["marshal_in_ms"] = factory.createScalar<double>(marshal_in_ms);
             ts[0]["phase1_ms"]     = factory.createScalar<double>(driver.t_phase1_ms);
             ts[0]["phase2_ms"]     = factory.createScalar<double>(driver.t_phase2_ms);
@@ -1081,6 +1172,9 @@ private:
             ts[0]["probe_converged"]  = factory.createScalar<double>(probe_conv_out);
             ts[0]["phase2_certified"] = factory.createScalar<double>(ph2_cert_out);
             ts[0]["phase2_checked"]   = factory.createScalar<double>(ph2_checked_out);
+            // true when A (and an explicit Omega2) were copied into MEX-owned buffers (RANDLAPACK_FNPP_COPY_INPUT=1 or a
+            // legacy build); false when the driver read MATLAB's arrays in place.
+            ts[0]["input_copied"]     = factory.createScalar<bool>(copy_input);
             ts[0]["first_row_ql_requested"] = factory.createScalar<bool>(first_row_ql != 0.0);
             ts[0]["first_row_ql_fallback"] = factory.createScalar<bool>(
                 scalar_qfa.first_row_ql_fallback_seen || driver.auto_sqfa.first_row_ql_fallback_seen);

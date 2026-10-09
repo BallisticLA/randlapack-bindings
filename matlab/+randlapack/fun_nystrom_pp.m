@@ -449,13 +449,24 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     % an n x 1 vector into an n x n array (20 GB at n = 50,000), so the check is
     % bypassed outright there rather than through SkipSymCheck.
     if ~skip_sym_check && ~vector_mode
-        A_diff = A - A.';
         if issparse(A)   % on the nonzeros: A(:) of a large sparse A would be an n^2-row vector
+            A_diff = A - A.';
             asym   = max([0; abs(nonzeros(A_diff))]);
             ascale = max([0; abs(nonzeros(A))]);
+            clear A_diff
         else
-            asym   = max(abs(A_diff(:)));
-            ascale = max(abs(A(:)));
+            % By column blocks of about 32 MB: A - A.' and abs(A(:)) would each be a full n x n temporary (two extra
+            % copies of A at peak). The maxima are exact, so the result equals the whole-matrix form bit for bit.
+            nb = max(1, floor(4e6 / max(n, 1)));
+            asym = zeros(1, 1, cls); ascale = zeros(1, 1, cls);
+            for j0 = 1:nb:n
+                J = j0:min(n, j0 + nb - 1);
+                Aj = A(:, J);
+                D  = abs(Aj - A(J, :).');            % (:) not 'all': max(...,'all') needs R2018b
+                asym   = max(asym, max(D(:)));
+                ascale = max(ascale, max(abs(Aj(:))));
+            end
+            clear Aj D
         end
         if ascale == 0, ascale = 1; end
         sym_tol = sqrt(eps(cls));

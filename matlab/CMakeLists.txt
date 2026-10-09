@@ -77,6 +77,29 @@ if(COMMAND randlapack_stage_runtime_dlls)
     randlapack_stage_runtime_dlls(fun_nystrom_pp_mex)
 endif()
 
+# NUMA page placement for large dense inputs (randlapack.numa_spread / numa_query / load_dense). Linux only; it needs
+# no RandLAPACK, only the MATLAB Data API. Built WITHOUT -ffast-math: load_dense's division must be the IEEE one.
+if(UNIX AND NOT APPLE)
+    matlab_add_mex(
+        NAME numa_place_mex
+        SRC src/numa_place_mex.cc
+        R2018a
+    )
+    set_target_properties(numa_place_mex PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY ${MEX_OUTPUT_DIR}
+        RUNTIME_OUTPUT_DIRECTORY ${MEX_OUTPUT_DIR}
+    )
+    target_compile_features(numa_place_mex PRIVATE cxx_std_20)
+    if(CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+        target_compile_options(numa_place_mex PRIVATE -fno-fast-math -fno-reciprocal-math)
+    endif()
+    # std::thread needs pthread_create; glibc < 2.34 (RHEL 8) keeps it in libpthread. Plain signature, as FindMatlab
+    # uses the plain target_link_libraries form on MEX targets.
+    find_package(Threads REQUIRED)
+    target_link_libraries(numa_place_mex Threads::Threads)
+    target_link_options(numa_place_mex PRIVATE ${MEX_STATIC_LIBSTDCXX_FLAGS})
+endif()
+
 # Windows: MATLAB's process already hosts Intel's OpenMP runtime (libiomp5md),
 # and a MEX compiled with /openmp:llvm injects MSVC's libomp140; two OpenMP
 # runtimes in one process abort at load (OMP Error #15). Intel's runtime and
