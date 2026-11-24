@@ -224,12 +224,19 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
     % vector).
     % Sparse A (double; MATLAB has no sparse single) must hold BOTH triangles: the MEX applies the whole matrix with
     % RandBLAS sparse products and never infers a triangle.
+    % A dense matrix is not scanned for Inf/NaN here: the scan reads all n^2 entries and builds an n^2 temporary on
+    % every call (about 18 s at n = 128,000, more than the estimator's own passes at small budgets). A non-finite
+    % entry still cannot pass silently: the dense probes touch every column, so it makes the estimate non-finite,
+    % which is checked after the MEX call. Sparse A (nonzeros only) and the n-vector form are cheap and keep the scan.
     if issparse(A)
         validateattributes(A, {'double'}, {'2d', 'real', 'finite'}, mfilename, 'A', 1);
     else
         validateattributes(A, {'single', 'double'}, ...
-                           {'2d', 'real', 'finite', 'nonsparse'}, ...
+                           {'2d', 'real', 'nonsparse'}, ...
                            mfilename, 'A', 1);
+        if isvector(A) && ~isscalar(A)
+            validateattributes(A, {'single', 'double'}, {'finite'}, mfilename, 'A', 1);
+        end
     end
     vector_mode = ~issparse(A) && isvector(A) && ~isscalar(A);
     if ~vector_mode && size(A, 1) ~= size(A, 2)
@@ -518,5 +525,10 @@ function [est, t1, t2, times] = fun_nystrom_pp(A, k, Omega2, varargin)
         [est, t1, t2, times] = fun_nystrom_pp_mex(mex_args{:});
         % The compressed-column conversion is part of getting a sparse A into the MEX.
         times.marshal_in_ms = times.marshal_in_ms + csc_ms;
+    end
+    if ~all(isfinite(est))
+        error('randlapack:fun_nystrom_pp:nonfinite', ...
+              ['The estimate is not finite. A dense A is not scanned for Inf/NaN on every call; check it ' ...
+               'once, e.g. with allfinite(A).']);
     end
 end
